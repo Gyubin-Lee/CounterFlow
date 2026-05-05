@@ -1,0 +1,122 @@
+diff --git a/mmaudio/model/networks.py b/mmaudio/model/networks.py
+index d38d062..7da85c5 100644
+--- a/mmaudio/model/networks.py
++++ b/mmaudio/model/networks.py
+@@ -216,8 +216,10 @@ class MMAudio(nn.Module):
+         # return (x - self.latent_mean) / self.latent_std
+         return x.sub_(self.latent_mean).div_(self.latent_std)
+ 
+-    def unnormalize(self, x: torch.Tensor) -> torch.Tensor:
++    def unnormalize(self, x: torch.Tensor, requires_grad: bool = False) -> torch.Tensor:
+         # return x * self.latent_std + self.latent_mean
++        if requires_grad:
++            return x.mul(self.latent_std).add(self.latent_mean)
+         return x.mul_(self.latent_std).add_(self.latent_mean)
+ 
+     def preprocess_conditions(self, clip_f: torch.Tensor, sync_f: torch.Tensor,
+@@ -237,7 +239,6 @@ class MMAudio(nn.Module):
+         sync_f = sync_f.view(bs, num_sync_segments, 8, -1) + self.sync_pos_emb
+         sync_f = sync_f.flatten(1, 2)  # (B, VN, D)
+ 
+-        # extend vf to match x
+         clip_f = self.clip_input_proj(clip_f)  # (B, VN, D)
+         sync_f = self.sync_input_proj(sync_f)  # (B, VN, D)
+         text_f = self.text_input_proj(text_f)  # (B, VN, D)
+@@ -339,6 +340,97 @@ class MMAudio(nn.Module):
+             return (cfg_strength * self.predict_flow(latent, t, conditions) +
+                     (1 - cfg_strength) * self.predict_flow(latent, t, empty_conditions))
+ 
++    def sde_wrapper(self, t: torch.Tensor, latent: torch.Tensor, conditions: PreprocessedConditions,
++                    empty_conditions: PreprocessedConditions, cfg_strength: float, sigma: float) -> torch.Tensor:
++        t = t * torch.ones(len(latent), device=latent.device, dtype=latent.dtype)
++
++        if cfg_strength < 1.0:
++            vector_field = self.predict_flow(latent, t, conditions)
++        else:
++            vector_field = (cfg_strength * self.predict_flow(latent, t, conditions) +
++                    (1 - cfg_strength) * self.predict_flow(latent, t, empty_conditions))
++
++        # Use explicit broadcast shape for batched latent tensors (B, N, D).
++        # With t shaped (B,), implicit broadcasting can fail for B>1.
++        t_broadcast = t.view(-1, 1, 1)
++        mu_SDE = (vector_field + 0.5 * (sigma ** 2) *
++                  (t_broadcast * vector_field - latent) / (1 - t_broadcast))
++
++        return mu_SDE
++        
++    def ode_wrapper_decomposed_cfg(
++                    self,
++                    t: torch.Tensor,
++                    latent: torch.Tensor,
++                    video_conditions: PreprocessedConditions,
++                    text_conditions: PreprocessedConditions,
++                    empty_conditions: PreprocessedConditions,
++                    cfg_video: float,
++                    cfg_text: float) -> torch.Tensor:
++        """
++        Decomposed CFG: separates video and text guidance.
++        flow = f(empty) + cfg_video * (f(video_only) - f(empty)) + cfg_text * (f(text_only) - f(empty))
++        
++        Args:
++            video_conditions: preprocessed with (video + empty_text)
++            text_conditions: preprocessed with (empty_video + text)
++            empty_conditions: preprocessed with (empty_video + empty_text)
++            cfg_video: guidance strength for video
++            cfg_text: guidance strength for text
++        """
++        t = t * torch.ones(len(latent), device=latent.device, dtype=latent.dtype)
++
++        empty_flow = self.predict_flow(latent, t, empty_conditions)
++        video_flow = self.predict_flow(latent, t, video_conditions)
++        text_flow = self.predict_flow(latent, t, text_conditions)
++
++        return empty_flow + cfg_video * (video_flow - empty_flow) + cfg_text * (text_flow - empty_flow)
++
++    def ode_wrapper_decomposed_cfg_neg_src(
++                    self,
++                    t: torch.Tensor,
++                    latent: torch.Tensor,
++                    video_conditions: PreprocessedConditions,
++                    tar_text_conditions: PreprocessedConditions,
++                    src_text_conditions: PreprocessedConditions,
++                    empty_conditions: PreprocessedConditions,
++                    cfg_video: float,
++                    cfg_text: float,
++                    enable_sde: bool = False,
++                    sigma: float = 0.0) -> torch.Tensor:
++        """
++        Decomposed CFG with negative source text.
++        Uses the difference between target and source text flows as the text direction,
++        rather than the difference from empty.
++        
++        flow = f(empty) + cfg_video * (f(video_only) - f(empty)) + cfg_text * (f(tar_text) - f(src_text))
++        
++        Args:
++            video_conditions: preprocessed with (video + empty_text)
++            tar_text_conditions: preprocessed with (empty_video + target_text)
++            src_text_conditions: preprocessed with (empty_video + source_text)
++            empty_conditions: preprocessed with (empty_video + empty_text)
++            cfg_video: guidance strength for video
++            cfg_text: guidance strength for text (target - source direction)
++        """
++        t = t * torch.ones(len(latent), device=latent.device, dtype=latent.dtype)
++
++        empty_flow = self.predict_flow(latent, t, empty_conditions)
++        video_flow = self.predict_flow(latent, t, video_conditions)
++        tar_text_flow = self.predict_flow(latent, t, tar_text_conditions)
++        src_text_flow = self.predict_flow(latent, t, src_text_conditions)
++
++        vector_field = empty_flow + cfg_video * (video_flow - empty_flow) + cfg_text * (tar_text_flow - src_text_flow)
++
++        if enable_sde:
++            # Match latent shape (B, N, D) for batched SDE calls.
++            t_broadcast = t.view(-1, 1, 1)
++            mu_SDE = (vector_field + 0.5 * (sigma ** 2) *
++                      (t_broadcast * vector_field - latent) / (1 - t_broadcast))
++            return mu_SDE
++
++        return vector_field
++
+     def load_weights(self, src_dict) -> None:
+         if 't_embed.freqs' in src_dict:
+             del src_dict['t_embed.freqs']

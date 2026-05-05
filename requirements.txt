@@ -1,0 +1,6 @@
+# CounterFlow-level orchestration and evaluation helpers.
+# Backend-specific requirements belong to external/MMAudio,
+# and external/av-benchmark.
+numpy
+pandas
+tqdm

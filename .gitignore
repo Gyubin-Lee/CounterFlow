@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+conda-env/
+
+# Local editor and agent files
+.codex
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Experiment tracking
+wandb/
+runs/
+mlruns/
+
+# External repositories cloned by scripts/setup_external_repos.sh
+external/MMAudio/
+external/av-benchmark/
+external/openFLAM/
+
+# Baseline repositories and local downloads
+baselines/CAFA/
+baselines/ReWaS/
+
+# Pretrained models
+pretrained/*
+!pretrained/README.md
+
+# Datasets
+datasets/*
+!datasets/README.md
+
+# Results and generated outputs
+results/*
+!results/README.md
+
+outputs/
+generated/
+samples/
+figures/
+
+# Model checkpoints and weights
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+
+# Large generated media
+*.wav
+*.mp4
+*.avi
+*.mov
+*.flac
+*.npy
+*.npz
+
+# Temporary files
+tmp/
+temp/
+.cache/
