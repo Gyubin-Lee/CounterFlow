@@ -163,6 +163,8 @@ python experiments/exp_vggsound_sparse.py \
 
 Use `--dry-run` to print the backend command without launching inference.
 
+The default CounterFlow-MMAudio experiment config matches the public demo: `cfg_text=5.0`, `transition_step=17`, Phase 1 ODE, Phase 2 ODE, `sigma=0.0`, and `seed=42`.
+
 For a quick clean-subset smoke test, use `--pilot --pilot_n 3` with `--subset clean`:
 
 ```bash

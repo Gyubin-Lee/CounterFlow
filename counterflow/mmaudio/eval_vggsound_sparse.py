@@ -356,8 +356,8 @@ def generate_audio_prompt_switch(net, feature_utils,
                                  transition_conditions, empty_conditions,
                                  src_text_conditions,
                                  device, dtype,
-                                 transition_step=5, num_steps=25,
-                                 cfg_strength=4.5, cfg_video=3.0, cfg_text=4.5,
+                                 transition_step=17, num_steps=25,
+                                 cfg_strength=4.5, cfg_video=3.0, cfg_text=5.0,
                                  seed=42, sigma=0.0,
                                  init_ode=True, transition_ode=True,
                                  neg_src=False, neg_src_both=False):
@@ -495,8 +495,8 @@ def generate_audio_prompt_switch_batched(net, feature_utils,
                                          transition_conditions, empty_conditions,
                                          src_text_conditions,
                                          batch_size, device, dtype,
-                                         transition_step=5, num_steps=25,
-                                         cfg_strength=4.5, cfg_video=3.0, cfg_text=4.5,
+                                         transition_step=17, num_steps=25,
+                                         cfg_strength=4.5, cfg_video=3.0, cfg_text=5.0,
                                          seed=42, sigma=0.0,
                                          init_ode=True, transition_ode=True,
                                          neg_src=False, neg_src_both=False):
@@ -930,20 +930,20 @@ def main():
                         help='Use neg_src in both Phase 1 and Phase 2')
 
     # Phase SDE/ODE
-    parser.add_argument('--init_ode', type=int, choices=[0, 1], default=0,
+    parser.add_argument('--init_ode', type=int, choices=[0, 1], default=1,
                         help='Phase 1: 1=ODE, 0=SDE')
-    parser.add_argument('--transition_ode', type=int, choices=[0, 1], default=0,
+    parser.add_argument('--transition_ode', type=int, choices=[0, 1], default=1,
                         help='Phase 2: 1=ODE, 0=SDE')
 
     # Sigma and transition step
-    parser.add_argument('--sigma', type=float, default=2.0, help='Sigma for SDE')
-    parser.add_argument('--transition_step', type=int, default=8, help='Transition step (1~num_steps)')
+    parser.add_argument('--sigma', type=float, default=0.0, help='Sigma for SDE')
+    parser.add_argument('--transition_step', type=int, default=17, help='Transition step (1~num_steps)')
 
     # Generation settings
     parser.add_argument('--num_steps', type=int, default=25, help='Number of Euler steps')
     parser.add_argument('--cfg_strength', type=float, default=4.5, help='CFG strength (Phase 2)')
     parser.add_argument('--cfg_video', type=float, default=3.0, help='Decomposed CFG video strength (Phase 1)')
-    parser.add_argument('--cfg_text', type=float, default=4.5, help='Decomposed CFG text strength (Phase 1)')
+    parser.add_argument('--cfg_text', type=float, default=5.0, help='Decomposed CFG text strength (Phase 1)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--duration', type=float, default=8.0, help='Audio duration')
 
