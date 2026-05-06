@@ -9,11 +9,4 @@ cd external/MMAudio
 git apply ../../patches/mmaudio_networks_counterflow.patch
 ```
 
-av-benchmark:
-
-```bash
-cd external/av-benchmark
-git apply ../../patches/av_benchmark_counterflow.patch
-```
-
-Apply only the patches needed for the experiment you are reproducing.
+No patch is needed for the optional av-benchmark evaluation dependency.

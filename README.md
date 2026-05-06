@@ -50,13 +50,6 @@ cd external/MMAudio
 git apply ../../patches/mmaudio_networks_counterflow.patch
 ```
 
-Apply the av-benchmark patch only when running the optional quantitative evaluation:
-
-```bash
-cd external/av-benchmark
-git apply ../../patches/av_benchmark_counterflow.patch
-```
-
 CounterFlow backend entry scripts are stored under `counterflow/mmaudio/`. The setup script copies them into MMAudio when the corresponding external files are missing or outdated.
 
 ## Conda Environments
