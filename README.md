@@ -176,6 +176,8 @@ Outputs are written under:
 results/demo/counterflow-cat-dog/
 ```
 
+The default demo config is `cfg_text=5.0`, `transition_step=17`, Phase 1 ODE, Phase 2 ODE, `sigma=0.0`, and `seed=42`.
+
 Run CounterFlow-MMAudio on a small local video manifest:
 
 ```bash

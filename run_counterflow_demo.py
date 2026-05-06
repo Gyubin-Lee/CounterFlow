@@ -65,15 +65,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", default="large_44k_v2")
     parser.add_argument("--duration", type=float, default=8.0)
     parser.add_argument("--num-steps", type=int, default=25)
-    parser.add_argument("--transition-step", type=int, default=8)
+    parser.add_argument("--transition-step", type=int, default=17)
     parser.add_argument("--cfg-strength", type=float, default=4.5)
     parser.add_argument("--cfg-video", type=float, default=3.0)
-    parser.add_argument("--cfg-text", type=float, default=4.5)
-    parser.add_argument("--sigma", type=float, default=2.0)
+    parser.add_argument("--cfg-text", type=float, default=5.0)
+    parser.add_argument("--sigma", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--init-ode", action="store_true", help="Use ODE for the initial source-video phase.")
-    parser.add_argument("--transition-ode", action="store_true", help="Use ODE for the target-prompt phase.")
+    parser.add_argument(
+        "--init-ode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use ODE for the initial source-video phase.",
+    )
+    parser.add_argument(
+        "--transition-ode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use ODE for the target-prompt phase.",
+    )
     parser.add_argument("--neg-src", action="store_true")
     parser.add_argument("--neg-src-both", action="store_true")
     parser.add_argument("--full-precision", action="store_true")
@@ -187,7 +197,7 @@ def main() -> None:
             cfg_strength=args.cfg_strength,
             cfg_video=args.cfg_video,
             cfg_text=args.cfg_text,
-            seed=args.seed + index - 1,
+            seed=args.seed,
             sigma=args.sigma,
             init_ode=args.init_ode,
             transition_ode=args.transition_ode,
@@ -220,7 +230,7 @@ def main() -> None:
             "num_steps": args.num_steps,
             "transition_step": args.transition_step,
             "sigma": args.sigma,
-            "seed": args.seed + index - 1,
+            "seed": args.seed,
             "init_ode": args.init_ode,
             "transition_ode": args.transition_ode,
             "neg_src": args.neg_src,
