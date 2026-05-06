@@ -155,6 +155,27 @@ Use `--dry-run` to print the backend command without launching inference.
 
 ## Demos
 
+Run the public CounterFlow prompt-switch demo with the tracked videos:
+
+```bash
+conda activate MMAudio
+export PYTHONNOUSERSITE=1
+CUDA_VISIBLE_DEVICES=0 python run_counterflow_demo.py --gpu 0
+```
+
+This demo uses:
+
+```text
+datasets/demo_videos/cat.mp4: source prompt "cat meowing" -> target prompt "horse neighing"
+datasets/demo_videos/dog.mp4: source prompt "dog barking" -> target prompt "bear growling"
+```
+
+Outputs are written under:
+
+```text
+results/demo/counterflow-cat-dog/
+```
+
 Run CounterFlow-MMAudio on a small local video manifest:
 
 ```bash

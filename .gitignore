@@ -45,6 +45,10 @@ pretrained/*
 # Datasets
 datasets/*
 !datasets/README.md
+!datasets/demo_videos/
+datasets/demo_videos/*
+!datasets/demo_videos/cat.mp4
+!datasets/demo_videos/dog.mp4
 
 # Results and generated outputs
 results/*
@@ -70,6 +74,8 @@ figures/
 *.flac
 *.npy
 *.npz
+!datasets/demo_videos/cat.mp4
+!datasets/demo_videos/dog.mp4
 
 # Temporary files
 tmp/
