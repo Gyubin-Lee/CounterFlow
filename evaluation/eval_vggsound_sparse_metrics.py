@@ -401,6 +401,47 @@ def compute_desync_window_score(
 
 
 @torch.inference_mode()
+def extract_video_features_from_file(
+    video_path: Path,
+    sync_model,
+    device: str,
+    duration: float = 8.0,
+) -> torch.Tensor:
+    """Extract Synchformer video features from one video with current av-benchmark."""
+    from einops import rearrange
+
+    from av_bench.data.video_dataset import VideoDataset
+
+    dataset = VideoDataset([Path(video_path)], duration_sec=duration)
+    sample = dataset[0]
+    if sample is None:
+        raise RuntimeError(f'Unable to decode video for DeSync: {video_path}')
+
+    sync_video = sample['sync_video'].unsqueeze(0).to(device)
+    b, t, c, h, w = sync_video.shape
+    if c != 3 or h != 224 or w != 224:
+        raise RuntimeError(
+            f'Unexpected Synchformer video tensor shape {tuple(sync_video.shape)} for {video_path}'
+        )
+
+    segment_size = 16
+    step_size = 8
+    num_segments = (t - segment_size) // step_size + 1
+    if num_segments <= 0:
+        raise RuntimeError(f'Not enough video frames for DeSync: {video_path}')
+
+    segments = [
+        sync_video[:, i * step_size:i * step_size + segment_size]
+        for i in range(num_segments)
+    ]
+    segment_batch = torch.stack(segments, dim=1)
+    segment_batch = rearrange(segment_batch, 'b s t c h w -> (b s) 1 t c h w')
+    video_feat = sync_model.extract_vfeats(segment_batch)
+    video_feat = rearrange(video_feat, '(b s) 1 t d -> b s t d', b=b)
+    return video_feat.squeeze(0).cpu()
+
+
+@torch.inference_mode()
 def compute_desync(
     mp4_files: List[Path],
     video_id_map: Dict[str, str],
@@ -423,15 +464,8 @@ def compute_desync(
         {str(mp4_path): desync_score}
     """
     sys.path.insert(0, str(AV_BENCHMARK_DIR))
-    from av_bench.synchformer.synchformer import Synchformer
-    import compute_clap_desync
-    from compute_clap_desync import (
-        encode_audio_with_sync,
-        extract_video_features_from_file,
-        make_class_grid,
-    )
-
-    compute_clap_desync.device = device
+    from av_bench.extract import encode_audio_with_sync
+    from av_bench.synchformer.synchformer import Synchformer, make_class_grid
 
     _syncformer_ckpt_path = AV_BENCHMARK_DIR / 'weights' / 'synchformer_state_dict.pth'
 
@@ -477,7 +511,12 @@ def compute_desync(
                 video_feature_cache[vid] = precomputed_video_features[vid]
             else:
                 try:
-                    video_feat = extract_video_features_from_file(mp4_file, duration=0.0)
+                    video_feat = extract_video_features_from_file(
+                        mp4_file,
+                        sync_model=sync_model,
+                        device=device,
+                        duration=audio_duration if audio_duration > 0 else 8.0,
+                    )
                     video_feature_cache[vid] = video_feat
                 except Exception as e:
                     log.error(f'Error extracting video features from {mp4_file}: {e}')

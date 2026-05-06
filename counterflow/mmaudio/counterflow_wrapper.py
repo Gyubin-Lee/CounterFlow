@@ -16,6 +16,14 @@ from pathlib import Path
 from typing import Sequence
 
 
+BACKEND_PATH_OPTIONS = {
+    "--clean_csv_path",
+    "--csv_path",
+    "--precomputed_features_dir",
+    "--video_root",
+}
+
+
 class MMAudioCounterFlowWrapper:
     """Thin subprocess wrapper around the CounterFlow-modified MMAudio script."""
 
@@ -41,6 +49,25 @@ class MMAudioCounterFlowWrapper:
         if not self.script_path.exists():
             self.install_backend_script()
 
+    def _project_path(self, path: str | Path) -> Path:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.project_root / candidate
+        return candidate.resolve()
+
+    def _normalize_backend_args(self, args: Sequence[str]) -> list[str]:
+        normalized: list[str] = []
+        pending_path_option = False
+        for arg in args:
+            if pending_path_option:
+                normalized.append(str(self._project_path(arg)))
+                pending_path_option = False
+                continue
+
+            normalized.append(arg)
+            pending_path_option = arg in BACKEND_PATH_OPTIONS
+        return normalized
+
     def build_command(
         self,
         *,
@@ -55,15 +82,15 @@ class MMAudioCounterFlowWrapper:
             sys.executable,
             str(self.script_path),
             "--output_dir",
-            str(output_dir),
+            str(self._project_path(output_dir)),
             "--exp_name",
             exp_name,
             "--subset",
             subset,
         ]
         if clean_csv_path is not None:
-            command.extend(["--clean_csv_path", str(clean_csv_path)])
-        command.extend(extra_args or [])
+            command.extend(["--clean_csv_path", str(self._project_path(clean_csv_path))])
+        command.extend(self._normalize_backend_args(extra_args or []))
         return command
 
     def run(self, command: Sequence[str], *, dry_run: bool = False) -> subprocess.CompletedProcess[str] | None:

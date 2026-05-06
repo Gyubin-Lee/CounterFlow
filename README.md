@@ -73,9 +73,9 @@ export PYTHONNOUSERSITE=1
 python -m pip install --upgrade pip setuptools wheel
 
 # Install the PyTorch wheel that matches your CUDA driver.
-# cu118 is a conservative default used by upstream MMAudio docs.
+# The 2.6.0/cu118 stack works with MMAudio, av-benchmark, and optional OpenFLAM.
 python -m pip install \
-  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
   --index-url https://download.pytorch.org/whl/cu118
 
 # ffmpeg is used when composing generated audio back into videos.
@@ -103,11 +103,24 @@ python -m pip install -e external/av-benchmark
 python -m pip install openflam
 ```
 
-If `git apply` reports that the MMAudio patch is already applied, keep going. If packages installed in `~/.local` still leak into your Conda environment, keep `PYTHONNOUSERSITE=1` set while running inference and evaluation commands.
+If `git apply` reports that the MMAudio patch is already applied, keep going. Avoid installing OpenFLAM before the PyTorch 2.6.0 stack above is in place; otherwise pip may upgrade the torch packages to a mismatched set. If packages installed in `~/.local` still leak into your Conda environment, keep `PYTHONNOUSERSITE=1` set while running inference and evaluation commands.
 
 ## Pretrained Models
 
-Do not commit pretrained model files. Place them under:
+Do not commit pretrained model files. MMAudio checkpoints are downloaded automatically by the MMAudio backend on first run. For CLAP and DeSync evaluation, prepare av-benchmark checkpoints with:
+
+```bash
+bash scripts/download_pretrained_models.sh
+```
+
+This downloads:
+
+```text
+external/av-benchmark/weights/music_speech_audioset_epoch_15_esc_89.98.pt
+external/av-benchmark/weights/synchformer_state_dict.pth
+```
+
+Local or manually downloaded model files can also be placed under:
 
 ```text
 pretrained/mmaudio/
@@ -220,18 +233,24 @@ Quantitative VGGSound-Sparse evaluation should run in the `MMAudio` environment:
 
 ```bash
 conda activate MMAudio
+export PYTHONNOUSERSITE=1
 python evaluation/eval_vggsound_sparse_metrics.py \
   --output_dir results/evaluation/VGGSound-Sparse/qualitative/2026-05-05_counterflow-mmaudio-default \
-  --filter_csv datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv
+  --filter_csv datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
+  --gpu 0
 ```
+
+The CLAP and DeSync metrics require the av-benchmark checkpoints downloaded by `scripts/download_pretrained_models.sh`. FAD is computed when `datasets/VGGSound-Sparse/gt_fad_stats.pt` exists or when a path is provided with `--gt_fad_stats`. DeSync uses `datasets/VGGSound-Sparse/test_video_features.pt` when present; otherwise it extracts video features from the generated mp4 files.
 
 FLAM metric evaluation:
 
 ```bash
 conda activate MMAudio
+export PYTHONNOUSERSITE=1
 python evaluation/eval_flam_metric.py \
   --exp_dir results/evaluation/VGGSound-Sparse/qualitative/2026-05-05_counterflow-mmaudio-default \
-  --filter_csv datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv
+  --filter_csv datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
+  --gpu_id 0
 ```
 
 Qualitative analysis notebook:

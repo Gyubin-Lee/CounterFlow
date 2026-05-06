@@ -4,13 +4,41 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-mkdir -p "${ROOT_DIR}/pretrained/mmaudio"
+AV_BENCH_WEIGHTS="${ROOT_DIR}/external/av-benchmark/weights"
+mkdir -p "${ROOT_DIR}/pretrained/mmaudio" "${AV_BENCH_WEIGHTS}"
 
-cat <<'MSG'
-Pretrained model downloads are intentionally not automated yet.
+download_if_missing() {
+  local url="$1"
+  local output="$2"
 
-Place model files under:
-  pretrained/mmaudio/
+  if [[ -s "${output}" ]]; then
+    echo "[skip] ${output}"
+    return
+  fi
 
-Checkpoints are ignored by Git.
+  echo "[download] ${url}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -L --fail --retry 3 -o "${output}" "${url}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "${output}" "${url}"
+  else
+    echo "curl or wget is required to download checkpoints." >&2
+    exit 1
+  fi
+}
+
+download_if_missing \
+  "https://huggingface.co/lukewys/laion_clap/resolve/main/music_speech_audioset_epoch_15_esc_89.98.pt" \
+  "${AV_BENCH_WEIGHTS}/music_speech_audioset_epoch_15_esc_89.98.pt"
+
+download_if_missing \
+  "https://github.com/hkchengrex/MMAudio/releases/download/v0.1/synchformer_state_dict.pth" \
+  "${AV_BENCH_WEIGHTS}/synchformer_state_dict.pth"
+
+cat <<MSG
+Evaluation checkpoints are ready under:
+  ${AV_BENCH_WEIGHTS}
+
+MMAudio model checkpoints are downloaded automatically by the MMAudio backend on first run.
+All checkpoint files are ignored by Git.
 MSG

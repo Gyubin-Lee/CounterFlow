@@ -1,6 +1,11 @@
 # CounterFlow-level orchestration and evaluation helpers.
 # Backend-specific requirements belong to external/MMAudio,
 # and external/av-benchmark.
-numpy
+#
+# These pins keep the MMAudio + av-benchmark + optional OpenFLAM stack
+# on a mutually compatible NumPy/OpenCV/Pillow set.
+numpy==1.26.4
+opencv-python<4.12
+pillow<12
 pandas
 tqdm
