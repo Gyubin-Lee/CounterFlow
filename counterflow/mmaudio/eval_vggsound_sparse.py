@@ -156,6 +156,8 @@ def filter_pending_videos(video_entries, output_dir: Path):
 def build_experiment_config(args, num_videos):
     return {
         "exp_name": args.exp_name,
+        "csv_path": args.csv_path,
+        "video_root": args.video_root,
         "neg_src": args.neg_src,
         "neg_src_both": args.neg_src_both,
         "init_ode": args.init_ode,
@@ -187,7 +189,7 @@ def find_config_mismatches(existing_config, current_config):
         "init_ode", "transition_ode", "sigma",
         "transition_step", "num_steps",
         "cfg_strength", "cfg_video", "cfg_text",
-        "seed", "variant", "subset",
+        "seed", "variant", "subset", "csv_path", "video_root",
         "clean_csv_path", "pilot", "pilot_n",
         "batch_size", "precomputed_features_dir",
         "duration",
@@ -902,6 +904,8 @@ def worker_fn(gpu_id, video_entries, args):
 
 
 def main():
+    global CSV_PATH, VIDEO_ROOT
+
     parser = argparse.ArgumentParser(description='VGGSound-Sparse Evaluation')
 
     # GPU options
@@ -913,6 +917,11 @@ def main():
                         help='Base output directory')
     parser.add_argument('--exp_name', type=str, required=True,
                         help='Experiment name (results saved under output_dir/exp_name/)')
+    parser.add_argument('--csv_path', type=str, default=str(CSV_PATH),
+                        help='Path to VGGSound-Sparse metadata CSV '
+                             '(default: VGGSound-Sparse/vggsound_sparse.csv)')
+    parser.add_argument('--video_root', type=str, default=str(VIDEO_ROOT),
+                        help='Directory containing VGGSound video mp4 files')
 
     # Generation method
     parser.add_argument('--neg_src', action='store_true', default=False,
@@ -968,6 +977,9 @@ def main():
                         help='Number of videos in pilot mode')
 
     args = parser.parse_args()
+
+    CSV_PATH = Path(args.csv_path).expanduser().resolve()
+    VIDEO_ROOT = Path(args.video_root).expanduser().resolve()
 
     # Convert int to bool for ODE flags
     args.init_ode = bool(args.init_ode)

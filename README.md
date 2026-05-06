@@ -148,10 +148,29 @@ These directories are ignored because they may contain downloaded code, checkpoi
 
 ```bash
 conda activate MMAudio
-python experiments/exp_vggsound_sparse.py --exp-name 2026-05-05_counterflow-mmaudio-default
+python experiments/exp_vggsound_sparse.py \
+  --exp-name 2026-05-05_counterflow-mmaudio-default \
+  --csv_path datasets/VGGSound-Sparse/vggsound_sparse.csv \
+  --clean_csv_path datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
+  --video_root /path/to/vggsound/video
 ```
 
 Use `--dry-run` to print the backend command without launching inference.
+
+For a quick clean-subset smoke test, use `--pilot --pilot_n 3` with `--subset clean`:
+
+```bash
+conda activate MMAudio
+CUDA_VISIBLE_DEVICES=0 PYTHONNOUSERSITE=1 python experiments/exp_vggsound_sparse.py \
+  --exp-name smoke_mmaudio_clean3 \
+  --subset clean \
+  --pilot \
+  --pilot_n 3 \
+  --gpu 0 \
+  --csv_path datasets/VGGSound-Sparse/vggsound_sparse.csv \
+  --clean_csv_path datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
+  --video_root /path/to/vggsound/video
+```
 
 ## Demos
 
