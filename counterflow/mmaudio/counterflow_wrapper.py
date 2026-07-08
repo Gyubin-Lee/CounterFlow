@@ -20,6 +20,7 @@ BACKEND_PATH_OPTIONS = {
     "--clean_csv_path",
     "--csv_path",
     "--precomputed_features_dir",
+    "--target_prompt_bank",
     "--video_root",
 }
 
@@ -30,15 +31,16 @@ class MMAudioCounterFlowWrapper:
     def __init__(self, project_root: Path | None = None, repo_dir: Path | None = None) -> None:
         self.project_root = (project_root or Path(__file__).resolve().parents[2]).resolve()
         self.repo_dir = (repo_dir or self.project_root / "external" / "MMAudio").resolve()
-        self.script_path = self.repo_dir / "eval_vggsound_sparse.py"
         self.script_src = self.project_root / "counterflow" / "mmaudio" / "eval_vggsound_sparse.py"
+        self.script_path = self.script_src
+        self.backend_script_path = self.repo_dir / "eval_vggsound_sparse.py"
 
     def install_backend_script(self, *, overwrite: bool = False) -> None:
         if not self.script_src.exists():
             raise FileNotFoundError(f"CounterFlow MMAudio script source not found: {self.script_src}")
-        if self.script_path.exists() and not overwrite:
+        if self.backend_script_path.exists() and not overwrite:
             return
-        shutil.copy2(self.script_src, self.script_path)
+        shutil.copy2(self.script_src, self.backend_script_path)
 
     def validate(self) -> None:
         if not self.repo_dir.exists():
@@ -46,8 +48,8 @@ class MMAudioCounterFlowWrapper:
                 f"MMAudio repository not found: {self.repo_dir}. "
                 "Run scripts/setup_external_repos.sh first."
             )
-        if not self.script_path.exists():
-            self.install_backend_script()
+        if not self.script_src.exists():
+            raise FileNotFoundError(f"CounterFlow MMAudio script source not found: {self.script_src}")
 
     def _project_path(self, path: str | Path) -> Path:
         candidate = Path(path).expanduser()

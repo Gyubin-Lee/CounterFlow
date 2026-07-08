@@ -1,3 +1,3 @@
 """CounterFlow project code."""
 
-__all__ = ["mmaudio", "utils"]
+__all__ = ["hunyuan", "mmaudio", "utils"]

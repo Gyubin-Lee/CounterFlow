@@ -1,6 +1,6 @@
 # CounterFlow-level orchestration and evaluation helpers.
 # Backend-specific requirements belong to external/MMAudio,
-# and external/av-benchmark.
+# external/HunyuanVideo-Foley, and external/av-benchmark.
 #
 # These pins keep the MMAudio + av-benchmark + optional OpenFLAM stack
 # on a mutually compatible NumPy/OpenCV/Pillow set.

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXP_DIR="${1:-${ROOT_DIR}/results/evaluation/VGGSound-Sparse/qualitative/demo_counterflow}"
+EXP_DIR="${1:-${ROOT_DIR}/results/research_axes/latent_update_method/evaluation/VGGSound-Sparse/qualitative/demo_counterflow}"
 FILTER_CSV="${2:-${ROOT_DIR}/datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv}"
 GPU="${GPU:-0}"
 

@@ -6,6 +6,7 @@ Expected layout:
 
 ```text
 external/MMAudio/
+external/HunyuanVideo-Foley/
 external/av-benchmark/
 ```
 

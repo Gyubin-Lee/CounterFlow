@@ -15,9 +15,12 @@ import logging
 import argparse
 import csv
 import json
+import math
 import os
 import random
+import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -27,9 +30,20 @@ import torch.multiprocessing as mp
 import torchaudio
 from tqdm import tqdm
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MMAUDIO_ROOT = PROJECT_ROOT / "external" / "MMAudio"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if str(MMAUDIO_ROOT) not in sys.path:
+    sys.path.insert(0, str(MMAUDIO_ROOT))
+
 from mmaudio.eval_utils import ModelConfig, all_model_cfg, load_video, setup_eval_logging
 from mmaudio.model.networks import MMAudio, get_my_mmaudio
 from mmaudio.model.utils.features_utils import FeaturesUtils
+
+SAMPLER_STRICT_2PHASE = "strict_2phase"
+SAMPLER_SMOOTH_MEAN_COUPLED = "smooth_mean_coupled"
+SAMPLER_PHASE2_VIDEO_DECAY = "phase2_video_decay"
 
 # 12 categories in VGGSound-Sparse
 CATEGORIES = [
@@ -118,7 +132,200 @@ def get_wrong_categories(correct_category):
     return [c for c in CATEGORIES if c != correct_category]
 
 
-def is_video_fully_processed(video_entry, output_dir: Path):
+def safe_prompt_slug(prompt: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(prompt).strip()).strip("_")
+    return slug or "prompt"
+
+
+def load_target_prompt_map(prompt_bank_path: str | None, target_case: str) -> dict | None:
+    if not prompt_bank_path:
+        return None
+
+    path = Path(prompt_bank_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Target prompt bank not found: {path}")
+
+    with open(path) as f:
+        data = json.load(f)
+
+    items = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError(f"Target prompt bank must contain an items list: {path}")
+
+    prompt_map = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        source_category = item.get("source_category") or item.get("source_caption_original")
+        if not source_category:
+            raise ValueError(f"Prompt-bank item missing source_category: {item}")
+
+        source_prompt = (
+            item.get("source_caption")
+            or item.get("source_caption_active")
+            or item.get("source_prompt")
+            or source_category
+        )
+        case_rows = item.get(target_case)
+        if not isinstance(case_rows, list):
+            raise ValueError(
+                f"Prompt-bank item for {source_category!r} missing list case {target_case!r}"
+            )
+
+        target_prompts = []
+        for row in case_rows:
+            if isinstance(row, str):
+                target_prompt = row
+            elif isinstance(row, dict):
+                target_prompt = row.get("target_prompt") or row.get("target_caption")
+            else:
+                target_prompt = None
+            if target_prompt:
+                target_prompts.append(str(target_prompt).strip())
+
+        target_prompts = list(dict.fromkeys(prompt for prompt in target_prompts if prompt))
+        if not target_prompts:
+            raise ValueError(f"No target prompts for {source_category!r} case {target_case!r}")
+
+        prompt_map[source_category] = {
+            "source_prompt": str(source_prompt).strip(),
+            "target_prompts": target_prompts,
+        }
+
+    if not prompt_map:
+        raise ValueError(f"No prompt-bank items loaded from: {path}")
+    return prompt_map
+
+
+def get_prompt_plan(video_entry, args=None):
+    correct_category = video_entry['category']
+    target_prompt_map = getattr(args, 'target_prompt_map', None) if args is not None else None
+    if not target_prompt_map:
+        return correct_category, get_wrong_categories(correct_category)
+    if correct_category not in target_prompt_map:
+        raise KeyError(f"No prompt-bank entry for source category: {correct_category}")
+    prompt_spec = target_prompt_map[correct_category]
+    return prompt_spec["source_prompt"], prompt_spec["target_prompts"]
+
+
+def needs_source_conditions(args) -> bool:
+    return (
+        args.neg_src
+        or args.neg_src_both
+        or args.sampler in {SAMPLER_SMOOTH_MEAN_COUPLED, SAMPLER_PHASE2_VIDEO_DECAY}
+    )
+
+
+def schedule_progress(step_index: int, num_steps: int, schedule: str) -> float:
+    if num_steps <= 1:
+        return 1.0
+    progress = step_index / (num_steps - 1)
+    progress = max(0.0, min(1.0, progress))
+    if schedule == "linear":
+        return progress
+    if schedule == "cosine":
+        return 0.5 - 0.5 * math.cos(math.pi * progress)
+    if schedule == "smoothstep":
+        return progress * progress * (3.0 - 2.0 * progress)
+    raise ValueError(f"Unknown smooth guidance schedule: {schedule}")
+
+
+def interpolate_schedule(start: float, end: float, progress: float) -> float:
+    return start + (end - start) * progress
+
+
+def smooth_mean_coupled_weights(step_index: int, num_steps: int, args) -> tuple[float, float, float]:
+    progress = schedule_progress(step_index, num_steps, args.smooth_schedule)
+    w_vid = interpolate_schedule(args.smooth_w_vid_start, args.smooth_w_vid_end, progress)
+    w_tar = interpolate_schedule(args.smooth_w_tar_start, args.smooth_w_tar_end, progress)
+    if args.smooth_src_basis == "mean":
+        src_basis = 0.5 * (w_vid + w_tar)
+    elif args.smooth_src_basis == "w_vid":
+        src_basis = w_vid
+    else:
+        raise ValueError(f"Unknown smooth source guidance basis: {args.smooth_src_basis}")
+    w_src = args.smooth_src_alpha * src_basis
+    return w_vid, w_tar, w_src
+
+
+def phase2_progress(step_index: int, transition_step: int, num_steps: int, schedule: str) -> float:
+    denom = num_steps - transition_step - 1
+    if denom <= 0:
+        return 1.0
+    progress = (step_index - transition_step) / denom
+    progress = max(0.0, min(1.0, progress))
+    if schedule == "linear":
+        return progress
+    if schedule == "cosine":
+        return 0.5 - 0.5 * math.cos(math.pi * progress)
+    if schedule == "smoothstep":
+        return progress * progress * (3.0 - 2.0 * progress)
+    raise ValueError(f"Unknown phase2 guidance schedule: {schedule}")
+
+
+def phase2_video_decay_weights(step_index: int, num_steps: int, transition_step: int, args) -> tuple[float, float, float]:
+    progress = phase2_progress(step_index, transition_step, num_steps, args.phase2_schedule)
+    w_vid = interpolate_schedule(args.phase2_w_vid_start, args.phase2_w_vid_end, progress)
+    w_tar = args.phase2_w_tar
+    if args.phase2_src_mode == "const":
+        w_src = args.phase2_w_src_const if args.phase2_w_src_const is not None else args.phase2_w_tar
+    elif args.phase2_src_mode == "1p5_vid":
+        w_src = args.phase2_src_vid_multiplier * w_vid
+    else:
+        raise ValueError(f"Unknown phase2 source mode: {args.phase2_src_mode}")
+    return w_vid, w_tar, w_src
+
+
+def build_weight_schedule(args) -> list[dict]:
+    rows = []
+    for step_index in range(args.num_steps):
+        if args.sampler == SAMPLER_PHASE2_VIDEO_DECAY:
+            if step_index < args.transition_step:
+                rows.append({
+                    "step": step_index,
+                    "phase": 1,
+                    "w_video": args.cfg_video,
+                    "w_target": args.cfg_text,
+                    "w_source": args.cfg_text if args.neg_src else 0.0,
+                })
+            else:
+                w_vid, w_tar, w_src = phase2_video_decay_weights(
+                    step_index, args.num_steps, args.transition_step, args
+                )
+                rows.append({
+                    "step": step_index,
+                    "phase": 2,
+                    "w_video": w_vid,
+                    "w_target": w_tar,
+                    "w_source": w_src,
+                })
+        elif args.sampler == SAMPLER_SMOOTH_MEAN_COUPLED:
+            w_vid, w_tar, w_src = smooth_mean_coupled_weights(step_index, args.num_steps, args)
+            rows.append({
+                "step": step_index,
+                "phase": "smooth",
+                "w_video": w_vid,
+                "w_target": w_tar,
+                "w_source": w_src,
+            })
+        else:
+            phase = 1 if step_index < args.transition_step else 2
+            rows.append({
+                "step": step_index,
+                "phase": phase,
+                "w_video": args.cfg_video if phase == 1 else 0.0,
+                "w_target": args.cfg_text if phase == 1 else args.cfg_strength,
+                "w_source": (
+                    args.cfg_text if (phase == 1 and args.neg_src)
+                    else args.cfg_strength if (phase == 2 and args.neg_src_both)
+                    else 0.0
+                ),
+            })
+    return rows
+
+
+def is_video_fully_processed(video_entry, output_dir: Path, args=None):
     """Check whether all expected outputs for a video are already present."""
     video_id_str = get_video_id_str(video_entry)
     correct_dir = output_dir / video_id_str / "correct"
@@ -129,8 +336,9 @@ def is_video_fully_processed(video_entry, output_dir: Path):
     if not (correct_audio_path.exists() and correct_video_path.exists()):
         return False
 
-    for wrong_cat in get_wrong_categories(video_entry['category']):
-        safe_cat = wrong_cat.replace(" ", "_")
+    _, target_prompts = get_prompt_plan(video_entry, args)
+    for wrong_cat in target_prompts:
+        safe_cat = safe_prompt_slug(wrong_cat)
         wrong_audio_path = wrong_dir / f"{video_id_str}_{safe_cat}.wav"
         wrong_video_path = wrong_dir / f"{video_id_str}_{safe_cat}.mp4"
         if not (wrong_audio_path.exists() and wrong_video_path.exists()):
@@ -139,13 +347,13 @@ def is_video_fully_processed(video_entry, output_dir: Path):
     return True
 
 
-def filter_pending_videos(video_entries, output_dir: Path):
+def filter_pending_videos(video_entries, output_dir: Path, args=None):
     """Split entries into completed vs pending based on existing files."""
     pending_entries = []
     completed_count = 0
 
     for entry in video_entries:
-        if is_video_fully_processed(entry, output_dir):
+        if is_video_fully_processed(entry, output_dir, args):
             completed_count += 1
         else:
             pending_entries.append(entry)
@@ -156,8 +364,7 @@ def filter_pending_videos(video_entries, output_dir: Path):
 def build_experiment_config(args, num_videos):
     return {
         "exp_name": args.exp_name,
-        "csv_path": args.csv_path,
-        "video_root": args.video_root,
+        "sampler": args.sampler,
         "neg_src": args.neg_src,
         "neg_src_both": args.neg_src_both,
         "init_ode": args.init_ode,
@@ -178,21 +385,46 @@ def build_experiment_config(args, num_videos):
         "categories": CATEGORIES,
         "batch_size": args.batch_size,
         "precomputed_features_dir": args.precomputed_features_dir,
+        "target_prompt_bank": args.target_prompt_bank,
+        "target_case": args.target_case,
+        "custom_target_prompts": bool(getattr(args, 'target_prompt_map', None)),
+        "targets_per_source": {k: len(v["target_prompts"]) for k, v in (getattr(args, 'target_prompt_map', None) or {}).items()},
         "duration": args.duration,
+        "smooth_schedule": args.smooth_schedule,
+        "smooth_w_vid_start": args.smooth_w_vid_start,
+        "smooth_w_vid_end": args.smooth_w_vid_end,
+        "smooth_w_tar_start": args.smooth_w_tar_start,
+        "smooth_w_tar_end": args.smooth_w_tar_end,
+        "smooth_src_alpha": args.smooth_src_alpha,
+        "smooth_src_basis": args.smooth_src_basis,
+        "phase2_schedule": args.phase2_schedule,
+        "phase2_w_vid_start": args.phase2_w_vid_start,
+        "phase2_w_vid_end": args.phase2_w_vid_end,
+        "phase2_w_tar": args.phase2_w_tar,
+        "phase2_w_src_const": args.phase2_w_src_const,
+        "phase2_src_mode": args.phase2_src_mode,
+        "phase2_src_vid_multiplier": args.phase2_src_vid_multiplier,
     }
 
 
 def find_config_mismatches(existing_config, current_config):
     """Compare critical config keys and return mismatches."""
     keys_to_compare = [
-        "exp_name", "neg_src", "neg_src_both",
+        "exp_name", "sampler", "neg_src", "neg_src_both",
         "init_ode", "transition_ode", "sigma",
         "transition_step", "num_steps",
         "cfg_strength", "cfg_video", "cfg_text",
-        "seed", "variant", "subset", "csv_path", "video_root",
+        "seed", "variant", "subset",
         "clean_csv_path", "pilot", "pilot_n",
         "batch_size", "precomputed_features_dir",
-        "duration",
+        "target_prompt_bank", "target_case", "custom_target_prompts",
+        "targets_per_source", "duration",
+        "smooth_schedule", "smooth_w_vid_start", "smooth_w_vid_end",
+        "smooth_w_tar_start", "smooth_w_tar_end", "smooth_src_alpha",
+        "smooth_src_basis",
+        "phase2_schedule", "phase2_w_vid_start", "phase2_w_vid_end",
+        "phase2_w_tar", "phase2_w_src_const", "phase2_src_mode",
+        "phase2_src_vid_multiplier",
     ]
 
     mismatches = {}
@@ -427,6 +659,140 @@ def generate_audio_prompt_switch(net, feature_utils,
 
 
 @torch.inference_mode()
+def generate_audio_phase2_video_decay(net, feature_utils,
+                                      init_video_conditions, init_text_conditions,
+                                      transition_conditions, empty_conditions,
+                                      src_text_conditions,
+                                      device, dtype,
+                                      transition_step=17, num_steps=25,
+                                      cfg_video=3.0, cfg_text=5.0,
+                                      seed=42,
+                                      phase2_schedule="smoothstep",
+                                      phase2_w_vid_start=3.0,
+                                      phase2_w_vid_end=0.5,
+                                      phase2_w_tar=4.5,
+                                      phase2_w_src_const=None,
+                                      phase2_src_mode="const",
+                                      phase2_src_vid_multiplier=1.5):
+    """Generate audio with strict Phase 1 and residual video guidance in Phase 2."""
+    if src_text_conditions is None:
+        raise ValueError("phase2_video_decay sampler requires source text conditions")
+
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+
+    bs = 1
+    x0 = torch.randn(bs, net.latent_seq_len, net.latent_dim,
+                     device=device, dtype=dtype, generator=rng)
+
+    x = x0
+    steps = torch.linspace(0, 1, num_steps + 1)
+    args_like = argparse.Namespace(
+        phase2_schedule=phase2_schedule,
+        phase2_w_vid_start=phase2_w_vid_start,
+        phase2_w_vid_end=phase2_w_vid_end,
+        phase2_w_tar=phase2_w_tar,
+        phase2_w_src_const=phase2_w_src_const,
+        phase2_src_mode=phase2_src_mode,
+        phase2_src_vid_multiplier=phase2_src_vid_multiplier,
+    )
+
+    for ti, t in enumerate(steps[:-1]):
+        next_t = steps[ti + 1]
+        dt = next_t - t
+
+        if ti < transition_step:
+            vector_field = net.ode_wrapper_decomposed_cfg_neg_src(
+                t, x, init_video_conditions, init_text_conditions,
+                src_text_conditions, empty_conditions, cfg_video, cfg_text
+            )
+        else:
+            w_vid, w_tar, w_src = phase2_video_decay_weights(
+                ti, num_steps, transition_step, args_like
+            )
+            t_batch = t * torch.ones(len(x), device=x.device, dtype=x.dtype)
+            vector_field_empty = net.predict_flow(x, t_batch, empty_conditions)
+            vector_field_video = net.predict_flow(x, t_batch, init_video_conditions)
+            vector_field_tar = net.predict_flow(x, t_batch, transition_conditions)
+            vector_field_src = net.predict_flow(x, t_batch, src_text_conditions)
+            vector_field = (
+                vector_field_empty
+                + w_vid * (vector_field_video - vector_field_empty)
+                + w_tar * (vector_field_tar - vector_field_empty)
+                - w_src * (vector_field_src - vector_field_empty)
+            )
+        x = x + dt * vector_field
+
+    x1 = net.unnormalize(x)
+    spec = feature_utils.decode(x1)
+    audio = feature_utils.vocode(spec)
+
+    return audio.float().cpu()[0]
+
+
+@torch.inference_mode()
+def generate_audio_smooth_mean_coupled(net, feature_utils,
+                                       video_conditions, target_conditions,
+                                       empty_conditions, src_text_conditions,
+                                       device, dtype,
+                                       num_steps=25, seed=42,
+                                       smooth_schedule="smoothstep",
+                                       smooth_w_vid_start=3.5,
+                                       smooth_w_vid_end=1.2,
+                                       smooth_w_tar_start=1.8,
+                                       smooth_w_tar_end=5.0,
+                                       smooth_src_alpha=1.0,
+                                       smooth_src_basis="mean"):
+    """Generate audio with smooth mean-coupled video/target/source guidance."""
+    if src_text_conditions is None:
+        raise ValueError("smooth_mean_coupled sampler requires source text conditions")
+
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+
+    bs = 1
+    x0 = torch.randn(bs, net.latent_seq_len, net.latent_dim,
+                     device=device, dtype=dtype, generator=rng)
+
+    x = x0
+    steps = torch.linspace(0, 1, num_steps + 1)
+
+    args_like = argparse.Namespace(
+        smooth_schedule=smooth_schedule,
+        smooth_w_vid_start=smooth_w_vid_start,
+        smooth_w_vid_end=smooth_w_vid_end,
+        smooth_w_tar_start=smooth_w_tar_start,
+        smooth_w_tar_end=smooth_w_tar_end,
+        smooth_src_alpha=smooth_src_alpha,
+        smooth_src_basis=smooth_src_basis,
+    )
+
+    for ti, t in enumerate(steps[:-1]):
+        next_t = steps[ti + 1]
+        dt = next_t - t
+
+        w_vid, w_tar, w_src = smooth_mean_coupled_weights(ti, num_steps, args_like)
+        t_batch = t * torch.ones(len(x), device=x.device, dtype=x.dtype)
+        vector_field_empty = net.predict_flow(x, t_batch, empty_conditions)
+        vector_field_video = net.predict_flow(x, t_batch, video_conditions)
+        vector_field_tar = net.predict_flow(x, t_batch, target_conditions)
+        vector_field_src = net.predict_flow(x, t_batch, src_text_conditions)
+        vector_field = (
+            vector_field_empty
+            + w_vid * (vector_field_video - vector_field_empty)
+            + w_tar * (vector_field_tar - vector_field_empty)
+            - w_src * (vector_field_src - vector_field_empty)
+        )
+        x = x + dt * vector_field
+
+    x1 = net.unnormalize(x)
+    spec = feature_utils.decode(x1)
+    audio = feature_utils.vocode(spec)
+
+    return audio.float().cpu()[0]
+
+
+@torch.inference_mode()
 def prepare_conditions_transition_batched(net, feature_utils, clip_frames, sync_frames,
                                           target_prompts, source_prompt,
                                           neg_src, neg_src_both,
@@ -579,9 +945,142 @@ def generate_audio_prompt_switch_batched(net, feature_utils,
     return [audio_cpu[i] for i in range(batch_size)]
 
 
+@torch.inference_mode()
+def generate_audio_phase2_video_decay_batched(net, feature_utils,
+                                              init_video_conditions, init_text_conditions,
+                                              transition_conditions, empty_conditions,
+                                              src_text_conditions,
+                                              batch_size, device, dtype,
+                                              transition_step=17, num_steps=25,
+                                              cfg_video=3.0, cfg_text=5.0,
+                                              seed=42,
+                                              phase2_schedule="smoothstep",
+                                              phase2_w_vid_start=3.0,
+                                              phase2_w_vid_end=0.5,
+                                              phase2_w_tar=4.5,
+                                              phase2_w_src_const=None,
+                                              phase2_src_mode="const",
+                                              phase2_src_vid_multiplier=1.5):
+    """Batched strict Phase 1 + Phase 2 residual video guidance sampler."""
+    if src_text_conditions is None:
+        raise ValueError("phase2_video_decay sampler requires source text conditions")
+
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+
+    x0_single = torch.randn(1, net.latent_seq_len, net.latent_dim,
+                            device=device, dtype=dtype, generator=rng)
+    x = x0_single.expand(batch_size, -1, -1).contiguous()
+
+    steps = torch.linspace(0, 1, num_steps + 1)
+    args_like = argparse.Namespace(
+        phase2_schedule=phase2_schedule,
+        phase2_w_vid_start=phase2_w_vid_start,
+        phase2_w_vid_end=phase2_w_vid_end,
+        phase2_w_tar=phase2_w_tar,
+        phase2_w_src_const=phase2_w_src_const,
+        phase2_src_mode=phase2_src_mode,
+        phase2_src_vid_multiplier=phase2_src_vid_multiplier,
+    )
+
+    for ti, t in enumerate(steps[:-1]):
+        next_t = steps[ti + 1]
+        dt = next_t - t
+
+        if ti < transition_step:
+            vector_field = net.ode_wrapper_decomposed_cfg_neg_src(
+                t, x, init_video_conditions, init_text_conditions,
+                src_text_conditions, empty_conditions, cfg_video, cfg_text
+            )
+        else:
+            w_vid, w_tar, w_src = phase2_video_decay_weights(
+                ti, num_steps, transition_step, args_like
+            )
+            t_batch = t * torch.ones(len(x), device=x.device, dtype=x.dtype)
+            vector_field_empty = net.predict_flow(x, t_batch, empty_conditions)
+            vector_field_video = net.predict_flow(x, t_batch, init_video_conditions)
+            vector_field_tar = net.predict_flow(x, t_batch, transition_conditions)
+            vector_field_src = net.predict_flow(x, t_batch, src_text_conditions)
+            vector_field = (
+                vector_field_empty
+                + w_vid * (vector_field_video - vector_field_empty)
+                + w_tar * (vector_field_tar - vector_field_empty)
+                - w_src * (vector_field_src - vector_field_empty)
+            )
+        x = x + dt * vector_field
+
+    x1 = net.unnormalize(x)
+    spec = feature_utils.decode(x1)
+    audio = feature_utils.vocode(spec)
+
+    audio_cpu = audio.float().cpu()
+    return [audio_cpu[i] for i in range(batch_size)]
+
+
+@torch.inference_mode()
+def generate_audio_smooth_mean_coupled_batched(net, feature_utils,
+                                               video_conditions, target_conditions,
+                                               empty_conditions, src_text_conditions,
+                                               batch_size, device, dtype,
+                                               num_steps=25, seed=42,
+                                               smooth_schedule="smoothstep",
+                                               smooth_w_vid_start=3.5,
+                                               smooth_w_vid_end=1.2,
+                                               smooth_w_tar_start=1.8,
+                                               smooth_w_tar_end=5.0,
+                                               smooth_src_alpha=1.0,
+                                               smooth_src_basis="mean"):
+    """Batched smooth mean-coupled guidance sampler."""
+    if src_text_conditions is None:
+        raise ValueError("smooth_mean_coupled sampler requires source text conditions")
+
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+
+    x0_single = torch.randn(1, net.latent_seq_len, net.latent_dim,
+                            device=device, dtype=dtype, generator=rng)
+    x = x0_single.expand(batch_size, -1, -1).contiguous()
+
+    steps = torch.linspace(0, 1, num_steps + 1)
+    args_like = argparse.Namespace(
+        smooth_schedule=smooth_schedule,
+        smooth_w_vid_start=smooth_w_vid_start,
+        smooth_w_vid_end=smooth_w_vid_end,
+        smooth_w_tar_start=smooth_w_tar_start,
+        smooth_w_tar_end=smooth_w_tar_end,
+        smooth_src_alpha=smooth_src_alpha,
+        smooth_src_basis=smooth_src_basis,
+    )
+
+    for ti, t in enumerate(steps[:-1]):
+        next_t = steps[ti + 1]
+        dt = next_t - t
+
+        w_vid, w_tar, w_src = smooth_mean_coupled_weights(ti, num_steps, args_like)
+        t_batch = t * torch.ones(len(x), device=x.device, dtype=x.dtype)
+        vector_field_empty = net.predict_flow(x, t_batch, empty_conditions)
+        vector_field_video = net.predict_flow(x, t_batch, video_conditions)
+        vector_field_tar = net.predict_flow(x, t_batch, target_conditions)
+        vector_field_src = net.predict_flow(x, t_batch, src_text_conditions)
+        vector_field = (
+            vector_field_empty
+            + w_vid * (vector_field_video - vector_field_empty)
+            + w_tar * (vector_field_tar - vector_field_empty)
+            - w_src * (vector_field_src - vector_field_empty)
+        )
+        x = x + dt * vector_field
+
+    x1 = net.unnormalize(x)
+    spec = feature_utils.decode(x1)
+    audio = feature_utils.vocode(spec)
+
+    audio_cpu = audio.float().cpu()
+    return [audio_cpu[i] for i in range(batch_size)]
+
+
 def process_single_video(video_entry, args, net, feature_utils, seq_cfg, sampling_rate, device, dtype,
                          text_features_cache=None):
-    """Process a single video: generate correct + 11 wrong category audios."""
+    """Process a single video: generate correct + target prompt audios."""
     video_id = video_entry['video_id']
     start_sec = video_entry['start_sec']
     correct_category = video_entry['category']
@@ -600,17 +1099,18 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
     correct_video_path = correct_dir / f"{video_id_str}_correct.mp4"
     correct_done = correct_audio_path.exists() and correct_video_path.exists()
 
-    wrong_categories = get_wrong_categories(correct_category)
+    source_prompt, wrong_categories = get_prompt_plan(video_entry, args)
     existing_wrong_results = {}
     pending_wrong_categories = []
     for wrong_cat in wrong_categories:
-        safe_cat = wrong_cat.replace(" ", "_")
+        safe_cat = safe_prompt_slug(wrong_cat)
         wrong_audio_path = wrong_dir / f"{video_id_str}_{safe_cat}.wav"
         wrong_video_path = wrong_dir / f"{video_id_str}_{safe_cat}.mp4"
         if wrong_audio_path.exists() and wrong_video_path.exists():
             existing_wrong_results[wrong_cat] = {
-                "source_prompt": correct_category,
+                "source_prompt": source_prompt,
                 "target_prompt": wrong_cat,
+                "target_case": args.target_case if getattr(args, 'target_prompt_map', None) else None,
                 "audio_file": wrong_audio_path.name,
                 "video_file": wrong_video_path.name,
             }
@@ -662,9 +1162,9 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
         print(f"[SKIP] correct already exists: {video_id_str}")
     else:
         correct_conditions, correct_empty = prepare_conditions_standard(
-            net, feature_utils, clip_frames, sync_frames, correct_category, device, dtype,
+            net, feature_utils, clip_frames, sync_frames, source_prompt, device, dtype,
             precomputed_clip=precomputed_clip, precomputed_sync=precomputed_sync,
-            precomputed_text=_get_text(correct_category),
+            precomputed_text=_get_text(source_prompt),
         )
 
         # For correct, determine if Phase 1 uses SDE
@@ -686,8 +1186,10 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
         "start_sec": start_sec,
         "video_path": str(video_path),
         "correct_category": correct_category,
-        "prompt": correct_category,
+        "source_prompt": source_prompt,
+        "prompt": source_prompt,
         "generation_type": "standard",
+        "sampler": args.sampler,
         "seed": args.seed,
         "cfg_strength": args.cfg_strength,
         "cfg_video": args.cfg_video,
@@ -701,6 +1203,22 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
         "neg_src_both": args.neg_src_both,
         "variant": args.variant,
         "duration": args.duration,
+        "smooth_schedule": args.smooth_schedule,
+        "smooth_w_vid_start": args.smooth_w_vid_start,
+        "smooth_w_vid_end": args.smooth_w_vid_end,
+        "smooth_w_tar_start": args.smooth_w_tar_start,
+        "smooth_w_tar_end": args.smooth_w_tar_end,
+        "smooth_src_alpha": args.smooth_src_alpha,
+        "smooth_src_basis": args.smooth_src_basis,
+        "phase2_schedule": args.phase2_schedule,
+        "phase2_w_vid_start": args.phase2_w_vid_start,
+        "phase2_w_vid_end": args.phase2_w_vid_end,
+        "phase2_w_tar": args.phase2_w_tar,
+        "phase2_w_src_const": args.phase2_w_src_const,
+        "phase2_src_mode": args.phase2_src_mode,
+        "phase2_src_vid_multiplier": args.phase2_src_vid_multiplier,
+        "target_prompt_bank": args.target_prompt_bank,
+        "target_case": args.target_case if getattr(args, 'target_prompt_map', None) else None,
     }
     with open(correct_dir / "metadata.json", "w") as f:
         json.dump(correct_meta, f, ensure_ascii=False, indent=2)
@@ -709,6 +1227,7 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
     generated_wrong_results = {}
 
     if pending_wrong_categories:
+        need_src_conditions = needs_source_conditions(args)
         # Determine batch size (<=11 for wrong categories)
         wrong_batch_size = max(1, int(getattr(args, 'batch_size', 1)))
         wrong_batch_size = min(wrong_batch_size, len(pending_wrong_categories))
@@ -732,31 +1251,65 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
                  empty_cond_b, src_text_cond_b) = prepare_conditions_transition_batched(
                     net, feature_utils, clip_frames, sync_frames,
                     target_prompts=chunk,
-                    source_prompt=correct_category,
-                    neg_src=args.neg_src,
+                    source_prompt=source_prompt,
+                    neg_src=need_src_conditions,
                     neg_src_both=args.neg_src_both,
                     device=device, dtype=dtype,
                     precomputed_clip=precomputed_clip, precomputed_sync=precomputed_sync,
                     precomputed_target_texts=precomputed_target_texts,
-                    precomputed_source_text=_get_text(correct_category),
+                    precomputed_source_text=_get_text(source_prompt),
                 )
 
-                audios = generate_audio_prompt_switch_batched(
-                    net, feature_utils,
-                    init_video_cond_b, init_text_cond_b, transition_cond_b, empty_cond_b, src_text_cond_b,
-                    batch_size=n, device=device, dtype=dtype,
-                    transition_step=args.transition_step,
-                    num_steps=args.num_steps,
-                    cfg_strength=args.cfg_strength,
-                    cfg_video=args.cfg_video,
-                    cfg_text=args.cfg_text,
-                    seed=args.seed,
-                    sigma=args.sigma,
-                    init_ode=args.init_ode,
-                    transition_ode=args.transition_ode,
-                    neg_src=args.neg_src,
-                    neg_src_both=args.neg_src_both,
-                )
+                if args.sampler == SAMPLER_SMOOTH_MEAN_COUPLED:
+                    audios = generate_audio_smooth_mean_coupled_batched(
+                        net, feature_utils,
+                        init_video_cond_b, init_text_cond_b, empty_cond_b, src_text_cond_b,
+                        batch_size=n, device=device, dtype=dtype,
+                        num_steps=args.num_steps,
+                        seed=args.seed,
+                        smooth_schedule=args.smooth_schedule,
+                        smooth_w_vid_start=args.smooth_w_vid_start,
+                        smooth_w_vid_end=args.smooth_w_vid_end,
+                        smooth_w_tar_start=args.smooth_w_tar_start,
+                        smooth_w_tar_end=args.smooth_w_tar_end,
+                        smooth_src_alpha=args.smooth_src_alpha,
+                        smooth_src_basis=args.smooth_src_basis,
+                    )
+                elif args.sampler == SAMPLER_PHASE2_VIDEO_DECAY:
+                    audios = generate_audio_phase2_video_decay_batched(
+                        net, feature_utils,
+                        init_video_cond_b, init_text_cond_b, transition_cond_b, empty_cond_b, src_text_cond_b,
+                        batch_size=n, device=device, dtype=dtype,
+                        transition_step=args.transition_step,
+                        num_steps=args.num_steps,
+                        cfg_video=args.cfg_video,
+                        cfg_text=args.cfg_text,
+                        seed=args.seed,
+                        phase2_schedule=args.phase2_schedule,
+                        phase2_w_vid_start=args.phase2_w_vid_start,
+                        phase2_w_vid_end=args.phase2_w_vid_end,
+                        phase2_w_tar=args.phase2_w_tar,
+                        phase2_w_src_const=args.phase2_w_src_const,
+                        phase2_src_mode=args.phase2_src_mode,
+                        phase2_src_vid_multiplier=args.phase2_src_vid_multiplier,
+                    )
+                else:
+                    audios = generate_audio_prompt_switch_batched(
+                        net, feature_utils,
+                        init_video_cond_b, init_text_cond_b, transition_cond_b, empty_cond_b, src_text_cond_b,
+                        batch_size=n, device=device, dtype=dtype,
+                        transition_step=args.transition_step,
+                        num_steps=args.num_steps,
+                        cfg_strength=args.cfg_strength,
+                        cfg_video=args.cfg_video,
+                        cfg_text=args.cfg_text,
+                        seed=args.seed,
+                        sigma=args.sigma,
+                        init_ode=args.init_ode,
+                        transition_ode=args.transition_ode,
+                        neg_src=args.neg_src,
+                        neg_src_both=args.neg_src_both,
+                    )
                 for cat, audio in zip(chunk, audios):
                     wrong_audios[cat] = audio
         else:
@@ -765,37 +1318,71 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
                  empty_cond, src_text_cond) = prepare_conditions_transition(
                     net, feature_utils, clip_frames, sync_frames,
                     target_prompt=wrong_cat,
-                    source_prompt=correct_category,
-                    neg_src=args.neg_src,
+                    source_prompt=source_prompt,
+                    neg_src=need_src_conditions,
                     neg_src_both=args.neg_src_both,
                     device=device, dtype=dtype,
                     precomputed_clip=precomputed_clip, precomputed_sync=precomputed_sync,
                     precomputed_target_text=_get_text(wrong_cat),
-                    precomputed_source_text=_get_text(correct_category),
+                    precomputed_source_text=_get_text(source_prompt),
                 )
 
-                wrong_audios[wrong_cat] = generate_audio_prompt_switch(
-                    net, feature_utils,
-                    init_video_cond, init_text_cond, transition_cond, empty_cond, src_text_cond,
-                    device, dtype,
-                    transition_step=args.transition_step,
-                    num_steps=args.num_steps,
-                    cfg_strength=args.cfg_strength,
-                    cfg_video=args.cfg_video,
-                    cfg_text=args.cfg_text,
-                    seed=args.seed,
-                    sigma=args.sigma,
-                    init_ode=args.init_ode,
-                    transition_ode=args.transition_ode,
-                    neg_src=args.neg_src,
-                    neg_src_both=args.neg_src_both,
-                )
+                if args.sampler == SAMPLER_SMOOTH_MEAN_COUPLED:
+                    wrong_audios[wrong_cat] = generate_audio_smooth_mean_coupled(
+                        net, feature_utils,
+                        init_video_cond, init_text_cond, empty_cond, src_text_cond,
+                        device, dtype,
+                        num_steps=args.num_steps,
+                        seed=args.seed,
+                        smooth_schedule=args.smooth_schedule,
+                        smooth_w_vid_start=args.smooth_w_vid_start,
+                        smooth_w_vid_end=args.smooth_w_vid_end,
+                        smooth_w_tar_start=args.smooth_w_tar_start,
+                        smooth_w_tar_end=args.smooth_w_tar_end,
+                        smooth_src_alpha=args.smooth_src_alpha,
+                        smooth_src_basis=args.smooth_src_basis,
+                    )
+                elif args.sampler == SAMPLER_PHASE2_VIDEO_DECAY:
+                    wrong_audios[wrong_cat] = generate_audio_phase2_video_decay(
+                        net, feature_utils,
+                        init_video_cond, init_text_cond, transition_cond, empty_cond, src_text_cond,
+                        device, dtype,
+                        transition_step=args.transition_step,
+                        num_steps=args.num_steps,
+                        cfg_video=args.cfg_video,
+                        cfg_text=args.cfg_text,
+                        seed=args.seed,
+                        phase2_schedule=args.phase2_schedule,
+                        phase2_w_vid_start=args.phase2_w_vid_start,
+                        phase2_w_vid_end=args.phase2_w_vid_end,
+                        phase2_w_tar=args.phase2_w_tar,
+                        phase2_w_src_const=args.phase2_w_src_const,
+                        phase2_src_mode=args.phase2_src_mode,
+                        phase2_src_vid_multiplier=args.phase2_src_vid_multiplier,
+                    )
+                else:
+                    wrong_audios[wrong_cat] = generate_audio_prompt_switch(
+                        net, feature_utils,
+                        init_video_cond, init_text_cond, transition_cond, empty_cond, src_text_cond,
+                        device, dtype,
+                        transition_step=args.transition_step,
+                        num_steps=args.num_steps,
+                        cfg_strength=args.cfg_strength,
+                        cfg_video=args.cfg_video,
+                        cfg_text=args.cfg_text,
+                        seed=args.seed,
+                        sigma=args.sigma,
+                        init_ode=args.init_ode,
+                        transition_ode=args.transition_ode,
+                        neg_src=args.neg_src,
+                        neg_src_both=args.neg_src_both,
+                    )
 
         for wrong_cat in pending_wrong_categories:
             wrong_audio = wrong_audios[wrong_cat]
 
             # Sanitize category name for filename
-            safe_cat = wrong_cat.replace(" ", "_")
+            safe_cat = safe_prompt_slug(wrong_cat)
 
             # Save wrong audio only
             wrong_audio_path = wrong_dir / f"{video_id_str}_{safe_cat}.wav"
@@ -806,8 +1393,9 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
             combine_video_audio(video_path, wrong_audio, sampling_rate, str(wrong_video_path))
 
             generated_wrong_results[wrong_cat] = {
-                "source_prompt": correct_category,
+                "source_prompt": source_prompt,
                 "target_prompt": wrong_cat,
+                "target_case": args.target_case if getattr(args, 'target_prompt_map', None) else None,
                 "audio_file": str(wrong_audio_path.name),
                 "video_file": str(wrong_video_path.name),
             }
@@ -824,7 +1412,9 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
         "start_sec": start_sec,
         "video_path": str(video_path),
         "correct_category": correct_category,
+        "source_prompt": source_prompt,
         "generation_type": "prompt_switch",
+        "sampler": args.sampler,
         "neg_src": args.neg_src,
         "neg_src_both": args.neg_src_both,
         "init_ode": args.init_ode,
@@ -838,6 +1428,22 @@ def process_single_video(video_entry, args, net, feature_utils, seq_cfg, samplin
         "num_steps": args.num_steps,
         "variant": args.variant,
         "duration": args.duration,
+        "smooth_schedule": args.smooth_schedule,
+        "smooth_w_vid_start": args.smooth_w_vid_start,
+        "smooth_w_vid_end": args.smooth_w_vid_end,
+        "smooth_w_tar_start": args.smooth_w_tar_start,
+        "smooth_w_tar_end": args.smooth_w_tar_end,
+        "smooth_src_alpha": args.smooth_src_alpha,
+        "smooth_src_basis": args.smooth_src_basis,
+        "phase2_schedule": args.phase2_schedule,
+        "phase2_w_vid_start": args.phase2_w_vid_start,
+        "phase2_w_vid_end": args.phase2_w_vid_end,
+        "phase2_w_tar": args.phase2_w_tar,
+        "phase2_w_src_const": args.phase2_w_src_const,
+        "phase2_src_mode": args.phase2_src_mode,
+        "phase2_src_vid_multiplier": args.phase2_src_vid_multiplier,
+        "target_prompt_bank": args.target_prompt_bank,
+        "target_case": args.target_case if getattr(args, 'target_prompt_map', None) else None,
         "results": wrong_results,
     }
     with open(wrong_dir / "metadata.json", "w") as f:
@@ -904,8 +1510,6 @@ def worker_fn(gpu_id, video_entries, args):
 
 
 def main():
-    global CSV_PATH, VIDEO_ROOT
-
     parser = argparse.ArgumentParser(description='VGGSound-Sparse Evaluation')
 
     # GPU options
@@ -917,13 +1521,15 @@ def main():
                         help='Base output directory')
     parser.add_argument('--exp_name', type=str, required=True,
                         help='Experiment name (results saved under output_dir/exp_name/)')
-    parser.add_argument('--csv_path', type=str, default=str(CSV_PATH),
-                        help='Path to VGGSound-Sparse metadata CSV '
-                             '(default: VGGSound-Sparse/vggsound_sparse.csv)')
-    parser.add_argument('--video_root', type=str, default=str(VIDEO_ROOT),
-                        help='Directory containing VGGSound video mp4 files')
 
     # Generation method
+    parser.add_argument('--sampler', type=str, choices=[
+                            SAMPLER_STRICT_2PHASE,
+                            SAMPLER_SMOOTH_MEAN_COUPLED,
+                            SAMPLER_PHASE2_VIDEO_DECAY,
+                        ],
+                        default=SAMPLER_STRICT_2PHASE,
+                        help='CounterFlow sampler')
     parser.add_argument('--neg_src', action='store_true', default=False,
                         help='Use neg_src: text direction = f(tar) - f(src) in Phase 1')
     parser.add_argument('--neg_src_both', action='store_true', default=False,
@@ -947,6 +1553,41 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--duration', type=float, default=8.0, help='Audio duration')
 
+    # Smooth mean-coupled guidance settings
+    parser.add_argument('--smooth_schedule', type=str, choices=['smoothstep', 'cosine', 'linear'],
+                        default='smoothstep',
+                        help='Monotonic interpolation schedule for smooth mean-coupled guidance')
+    parser.add_argument('--smooth_w_vid_start', type=float, default=3.5,
+                        help='Initial video guidance weight for smooth mean-coupled guidance')
+    parser.add_argument('--smooth_w_vid_end', type=float, default=1.2,
+                        help='Final video guidance weight for smooth mean-coupled guidance')
+    parser.add_argument('--smooth_w_tar_start', type=float, default=1.8,
+                        help='Initial target text guidance weight for smooth mean-coupled guidance')
+    parser.add_argument('--smooth_w_tar_end', type=float, default=5.0,
+                        help='Final target text guidance weight for smooth mean-coupled guidance')
+    parser.add_argument('--smooth_src_alpha', type=float, default=1.0,
+                        help='Source-negative multiplier applied to --smooth_src_basis')
+    parser.add_argument('--smooth_src_basis', type=str, choices=['mean', 'w_vid'], default='mean',
+                        help='Basis for source-negative smooth guidance weight')
+
+    # Phase 2 video decay guidance settings
+    parser.add_argument('--phase2_schedule', type=str, choices=['smoothstep', 'cosine', 'linear'],
+                        default='smoothstep',
+                        help='Phase-2-only interpolation schedule for phase2_video_decay')
+    parser.add_argument('--phase2_w_vid_start', type=float, default=3.0,
+                        help='Video guidance at the first Phase 2 step')
+    parser.add_argument('--phase2_w_vid_end', type=float, default=0.5,
+                        help='Video guidance at the final Phase 2 step')
+    parser.add_argument('--phase2_w_tar', type=float, default=4.5,
+                        help='Target text guidance during Phase 2')
+    parser.add_argument('--phase2_w_src_const', type=float, default=None,
+                        help='Constant source-negative weight for phase2_src_mode=const. '
+                             'Defaults to --phase2_w_tar.')
+    parser.add_argument('--phase2_src_mode', type=str, choices=['const', '1p5_vid'], default='const',
+                        help='Source-negative Phase 2 schedule: const or multiplier * w_vid')
+    parser.add_argument('--phase2_src_vid_multiplier', type=float, default=1.5,
+                        help='Multiplier for source-negative weight when phase2_src_mode=1p5_vid')
+
     # Model
     parser.add_argument('--variant', type=str, default='large_44k_v2',
                         help='Model variant: small_16k, small_44k, medium_44k, large_44k, large_44k_v2')
@@ -956,6 +1597,14 @@ def main():
                         help='Evaluation subset: all=test split, clean=filter with clean subset CSV')
     parser.add_argument('--clean_csv_path', type=str, default=str(CLEAN_CSV_PATH),
                         help='Path to vggsound_sparse_clean_fixed_offset.csv (used with --subset clean)')
+
+    # Target prompt bank
+    parser.add_argument('--target_prompt_bank', type=str, default=None,
+                        help='Optional prompt_bank_raw.json with per-source target prompts. '
+                             'When set, only the selected --target_case prompts are generated.')
+    parser.add_argument('--target_case', type=str, default='semantic_replace_temporal_preserve',
+                        help='Prompt-bank case to use, e.g. semantic_replace_temporal_preserve '
+                             'or semantic_replace_temporal_shift')
 
     # Batching for wrong-category generation
     parser.add_argument('--batch_size', type=int, default=1,
@@ -978,9 +1627,6 @@ def main():
 
     args = parser.parse_args()
 
-    CSV_PATH = Path(args.csv_path).expanduser().resolve()
-    VIDEO_ROOT = Path(args.video_root).expanduser().resolve()
-
     # Convert int to bool for ODE flags
     args.init_ode = bool(args.init_ode)
     args.transition_ode = bool(args.transition_ode)
@@ -988,6 +1634,25 @@ def main():
     # neg_src_both implies neg_src
     if args.neg_src_both:
         args.neg_src = True
+    if args.sampler == SAMPLER_SMOOTH_MEAN_COUPLED:
+        if args.sigma != 0.0 or not args.init_ode or not args.transition_ode:
+            parser.error(
+                "smooth_mean_coupled currently supports deterministic ODE only; "
+                "use --sigma 0.0 --init_ode 1 --transition_ode 1"
+            )
+    if args.sampler == SAMPLER_PHASE2_VIDEO_DECAY:
+        if args.sigma != 0.0 or not args.init_ode or not args.transition_ode:
+            parser.error(
+                "phase2_video_decay currently supports deterministic ODE only; "
+                "use --sigma 0.0 --init_ode 1 --transition_ode 1"
+            )
+        args.neg_src_both = True
+        args.neg_src = True
+
+    try:
+        args.target_prompt_map = load_target_prompt_map(args.target_prompt_bank, args.target_case)
+    except (FileNotFoundError, ValueError) as e:
+        parser.error(str(e))
 
     # Resolve output path: output_dir/exp_name
     args.output_dir = str(Path(args.output_dir) / args.exp_name)
@@ -1001,6 +1666,23 @@ def main():
         print(f"Loaded {len(test_data)} clean test videos from VGGSound-Sparse")
     else:
         print(f"Loaded {len(test_data)} test videos from VGGSound-Sparse")
+
+    if args.target_prompt_map:
+        test_categories = {entry['category'] for entry in test_data}
+        covered_categories = set(args.target_prompt_map)
+        selected_categories = sorted(test_categories & covered_categories)
+        missing_categories = sorted(test_categories - covered_categories)
+        if not selected_categories:
+            parser.error("Target prompt bank does not cover any source category in this split.")
+        if missing_categories:
+            original_count = len(test_data)
+            test_data = [entry for entry in test_data if entry['category'] in covered_categories]
+            print(
+                "Filtered to prompt-bank source categories: "
+                f"kept {len(test_data)} / {original_count} videos for "
+                f"{len(selected_categories)} sources; skipped {len(missing_categories)} uncovered sources."
+            )
+        print(f"Loaded custom target prompts: {len(args.target_prompt_map)} sources, case={args.target_case}")
 
     # Pilot mode: random subset
     if args.pilot:
@@ -1026,8 +1708,12 @@ def main():
     else:
         with open(config_path, "w") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
+    weight_schedule_path = Path(args.output_dir) / "weight_schedule.json"
+    if not weight_schedule_path.exists():
+        with open(weight_schedule_path, "w") as f:
+            json.dump(build_weight_schedule(args), f, ensure_ascii=False, indent=2)
 
-    pending_test_data, completed_count = filter_pending_videos(test_data, Path(args.output_dir))
+    pending_test_data, completed_count = filter_pending_videos(test_data, Path(args.output_dir), args)
     if completed_count > 0:
         print(f"Resume mode: {completed_count}/{len(test_data)} videos already completed.")
     if not pending_test_data:

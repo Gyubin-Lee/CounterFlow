@@ -1,0 +1,510 @@
+diff --git a/.gitignore b/.gitignore
+index 1a037a0..f3fdca5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -157,3 +157,9 @@ tmp*.*
+ 
+ 
+ CLAUDE.md
++
++pseudo_eval/
++outputs/
++latent_intervention_*/
++
++eval_vggsound_sparse_output/
+\ No newline at end of file
+diff --git a/hunyuanvideo_foley/utils/feature_utils.py b/hunyuanvideo_foley/utils/feature_utils.py
+index 8680c3c..90e3153 100644
+--- a/hunyuanvideo_foley/utils/feature_utils.py
++++ b/hunyuanvideo_foley/utils/feature_utils.py
+@@ -60,8 +60,20 @@ def get_frames_av(
+ 
+     return output_frames, vid_len_in_s
+ 
++def _get_model_device(model_dict, model_name):
++    """Get the device for a specific model from device_map, falling back to model_dict.device."""
++    device_map = getattr(model_dict, 'device_map', None)
++    if device_map is not None:
++        if isinstance(device_map, dict):
++            return device_map.get(model_name, model_dict.device)
++        return getattr(device_map, model_name, model_dict.device)
++    return model_dict.device
++
++
+ @torch.inference_mode()
+ def encode_video_with_siglip2(x: torch.Tensor, model_dict, batch_size: int = -1):
++    siglip2_dev = _get_model_device(model_dict, 'siglip2')
++    x = x.to(siglip2_dev)
+     b, t, c, h, w = x.shape
+     if batch_size < 0:
+         batch_size = b * t
+@@ -81,6 +93,7 @@ def encode_video_with_sync(x: torch.Tensor, model_dict, batch_size: int = -1):
+         x: tensor in shape of [B, T, C, H, W]
+         batch_size: the batch_size for synchformer inference
+     """
++    sync_dev = _get_model_device(model_dict, 'syncformer')
+     b, t, c, h, w = x.shape
+     assert c == 3 and h == 224 and w == 224
+ 
+@@ -90,7 +103,7 @@ def encode_video_with_sync(x: torch.Tensor, model_dict, batch_size: int = -1):
+     segments = []
+     for i in range(num_segments):
+         segments.append(x[:, i * step_size : i * step_size + segment_size])
+-    x = torch.stack(segments, dim=1).cuda()  # (B, num_segments, segment_size, 3, 224, 224)
++    x = torch.stack(segments, dim=1).to(sync_dev)  # (B, num_segments, segment_size, 3, 224, 224)
+ 
+     outputs = []
+     if batch_size < 0:
+@@ -106,20 +119,23 @@ def encode_video_with_sync(x: torch.Tensor, model_dict, batch_size: int = -1):
+ 
+ @torch.inference_mode()
+ def encode_video_features(video_path, model_dict):
++    foley_dev = _get_model_device(model_dict, 'foley')
++    siglip2_dev = _get_model_device(model_dict, 'siglip2')
++
+     visual_features = {}
+     # siglip2 visual features
+     frames, ori_vid_len_in_s = get_frames_av(video_path, FPS_VISUAL["siglip2"])
+     images = [Image.fromarray(frame).convert('RGB') for frame in frames]
+     images = [model_dict.siglip2_preprocess(image) for image in images]  # [T, C, H, W]
+-    clip_frames = torch.stack(images).to(model_dict.device).unsqueeze(0)
+-    visual_features['siglip2_feat'] = encode_video_with_siglip2(clip_frames, model_dict).to(model_dict.device)
++    clip_frames = torch.stack(images).to(siglip2_dev).unsqueeze(0)
++    visual_features['siglip2_feat'] = encode_video_with_siglip2(clip_frames, model_dict).to(foley_dev)
+ 
+     # synchformer visual features
+     frames, ori_vid_len_in_s = get_frames_av(video_path, FPS_VISUAL["synchformer"])
+     images = torch.from_numpy(frames).permute(0, 3, 1, 2)  # [T, C, H, W]
+     sync_frames = model_dict.syncformer_preprocess(images).unsqueeze(0)  # [1, T, 3, 224, 224]
+     # [1, num_segments * 8, channel_dim], e.g. [1, 240, 768] for 10s video
+-    visual_features['syncformer_feat'] = encode_video_with_sync(sync_frames, model_dict)
++    visual_features['syncformer_feat'] = encode_video_with_sync(sync_frames, model_dict).to(foley_dev)
+ 
+     vid_len_in_s = sync_frames.shape[1] / FPS_VISUAL["synchformer"]
+     visual_features = AttributeDict(visual_features)
+@@ -128,10 +144,11 @@ def encode_video_features(video_path, model_dict):
+ 
+ @torch.inference_mode()
+ def encode_text_feat(text: List[str], model_dict):
+-    # x: (B, L)
+-    inputs = model_dict.clap_tokenizer(text, padding=True, return_tensors="pt").to(model_dict.device)
++    clap_dev = _get_model_device(model_dict, 'clap')
++    foley_dev = _get_model_device(model_dict, 'foley')
++    inputs = model_dict.clap_tokenizer(text, padding=True, return_tensors="pt").to(clap_dev)
+     outputs = model_dict.clap_model(**inputs, output_hidden_states=True, return_dict=True)
+-    return outputs.last_hidden_state, outputs.attentions
++    return outputs.last_hidden_state.to(foley_dev), outputs.attentions
+ 
+ 
+ def feature_process(video_path, prompt, model_dict, cfg, neg_prompt=None):
+diff --git a/hunyuanvideo_foley/utils/model_utils.py b/hunyuanvideo_foley/utils/model_utils.py
+index 4276bc9..a7fe3ad 100644
+--- a/hunyuanvideo_foley/utils/model_utils.py
++++ b/hunyuanvideo_foley/utils/model_utils.py
+@@ -14,14 +14,61 @@ from .schedulers import FlowMatchDiscreteScheduler
+ from tqdm import tqdm
+ 
+ 
+-class OffloadModelManager:    
+-    def __init__(self, model_path, config_path, device, enable_offload=True, model_filename=None):
++def build_device_map(gpu_ids, default_device):
++    """Build a device map assigning each model to a GPU.
++
++    foley_model is always on GPU 0 (largest model). The remaining 4 models
++    (dac, clap, siglip2, syncformer) are spread across the other GPUs.
++
++    Distribution by number of GPUs:
++      2 GPUs: GPU0=foley          GPU1=dac,clap,siglip2,syncformer
++      3 GPUs: GPU0=foley          GPU1=dac,clap    GPU2=siglip2,syncformer
++      4 GPUs: GPU0=foley          GPU1=dac,clap    GPU2=siglip2   GPU3=syncformer
++    """
++    if not gpu_ids:
++        return {
++            'foley': default_device,
++            'dac': default_device,
++            'siglip2': default_device,
++            'clap': default_device,
++            'syncformer': default_device,
++        }
++
++    devices = [torch.device(f"cuda:{gid}") for gid in gpu_ids]
++    n = len(devices)
++
++    device_map = {'foley': devices[0]}
++
++    if n == 1:
++        for name in ['dac', 'clap', 'siglip2', 'syncformer']:
++            device_map[name] = devices[0]
++    elif n == 2:
++        for name in ['dac', 'clap', 'siglip2', 'syncformer']:
++            device_map[name] = devices[1]
++    elif n == 3:
++        device_map['dac'] = devices[1]
++        device_map['clap'] = devices[1]
++        device_map['siglip2'] = devices[2]
++        device_map['syncformer'] = devices[2]
++    else:  # 4+
++        device_map['dac'] = devices[1]
++        device_map['clap'] = devices[1]
++        device_map['siglip2'] = devices[2]
++        device_map['syncformer'] = devices[3]
++
++    return device_map
++
++
++class OffloadModelManager:
++    def __init__(self, model_path, config_path, device, enable_offload=True, model_filename=None, device_map=None, feature_only=False):
+         self.model_path = model_path
+         self.config_path = config_path
+         self.device = device
++        self.device_map = device_map or {k: device for k in ['foley', 'dac', 'siglip2', 'clap', 'syncformer']}
+         self.enable_offload = enable_offload
++        self.feature_only = feature_only
+         self.model_filename = model_filename or "hunyuanvideo_foley.pth"
+-        
++
+         self._foley_model = None
+         self._dac_model = None
+         self._siglip2_model = None
+@@ -30,10 +77,12 @@ class OffloadModelManager:
+         self._clap_tokenizer = None
+         self._syncformer_model = None
+         self._syncformer_preprocess = None
+-        
++
+         self.cfg = load_yaml(config_path)
+-        
+-        if not enable_offload:
++
++        if feature_only:
++            self._load_feature_models()
++        elif not enable_offload:
+             self._load_all_models()
+     
+     def _clear_cache(self):
+@@ -43,48 +92,53 @@ class OffloadModelManager:
+     
+     def _load_foley_model(self):
+         if self._foley_model is None:
+-            logger.info("Loading HunyuanVideoFoley main model...")
+-            self._foley_model = HunyuanVideoFoley(self.cfg, dtype=torch.bfloat16, device=self.device).to(device=self.device, dtype=torch.bfloat16)
++            dev = self.device_map['foley']
++            logger.info(f"Loading HunyuanVideoFoley main model on {dev}...")
++            self._foley_model = HunyuanVideoFoley(self.cfg, dtype=torch.bfloat16, device=dev).to(device=dev, dtype=torch.bfloat16)
+             self._foley_model = load_state_dict(self._foley_model, os.path.join(self.model_path, self.model_filename))
+             self._foley_model.eval()
+-            logger.info("HunyuanVideoFoley model loaded")
++            logger.info(f"HunyuanVideoFoley model loaded on {dev}")
+         return self._foley_model
+-    
++
+     def _load_dac_model(self):
+         if self._dac_model is None:
++            dev = self.device_map['dac']
+             dac_path = os.path.join(self.model_path, "vae_128d_48k.pth")
+-            logger.info(f"Loading DAC VAE model from: {dac_path}")
++            logger.info(f"Loading DAC VAE model from: {dac_path} on {dev}")
+             self._dac_model = DAC.load(dac_path)
+-            self._dac_model = self._dac_model.to(self.device)
++            self._dac_model = self._dac_model.to(dev)
+             self._dac_model.requires_grad_(False)
+             self._dac_model.eval()
+-            logger.info("DAC VAE model loaded")
++            logger.info(f"DAC VAE model loaded on {dev}")
+         return self._dac_model
+-    
++
+     def _load_siglip2_model(self):
+         if self._siglip2_model is None:
+-            logger.info("Loading SigLIP2 visual encoder...")
++            dev = self.device_map['siglip2']
++            logger.info(f"Loading SigLIP2 visual encoder on {dev}...")
+             self._siglip2_preprocess = transforms.Compose([
+                 transforms.Resize((512, 512)),
+                 transforms.ToTensor(),
+                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+             ])
+-            self._siglip2_model = AutoModel.from_pretrained("google/siglip2-base-patch16-512").to(self.device).eval()
+-            logger.info("SigLIP2 model loaded")
++            self._siglip2_model = AutoModel.from_pretrained("google/siglip2-base-patch16-512").to(dev).eval()
++            logger.info(f"SigLIP2 model loaded on {dev}")
+         return self._siglip2_model, self._siglip2_preprocess
+-    
++
+     def _load_clap_model(self):
+         if self._clap_model is None:
+-            logger.info("Loading CLAP text encoder...")
++            dev = self.device_map['clap']
++            logger.info(f"Loading CLAP text encoder on {dev}...")
+             self._clap_tokenizer = AutoTokenizer.from_pretrained("laion/larger_clap_general")
+-            self._clap_model = ClapTextModelWithProjection.from_pretrained("laion/larger_clap_general").to(self.device)
+-            logger.info("CLAP model loaded")
++            self._clap_model = ClapTextModelWithProjection.from_pretrained("laion/larger_clap_general").to(dev)
++            logger.info(f"CLAP model loaded on {dev}")
+         return self._clap_model, self._clap_tokenizer
+-    
++
+     def _load_syncformer_model(self):
+         if self._syncformer_model is None:
++            dev = self.device_map['syncformer']
+             syncformer_path = os.path.join(self.model_path, "synchformer_state_dict.pth")
+-            logger.info(f"Loading Synchformer model from: {syncformer_path}")
++            logger.info(f"Loading Synchformer model from: {syncformer_path} on {dev}")
+             self._syncformer_preprocess = v2.Compose([
+                 v2.Resize(224, interpolation=v2.InterpolationMode.BICUBIC),
+                 v2.CenterCrop(224),
+@@ -94,8 +148,8 @@ class OffloadModelManager:
+             ])
+             self._syncformer_model = Synchformer()
+             self._syncformer_model.load_state_dict(torch.load(syncformer_path, weights_only=False, map_location="cpu"))
+-            self._syncformer_model = self._syncformer_model.to(self.device).eval()
+-            logger.info("Synchformer model loaded")
++            self._syncformer_model = self._syncformer_model.to(dev).eval()
++            logger.info(f"Synchformer model loaded on {dev}")
+         return self._syncformer_model, self._syncformer_preprocess
+     
+     def _unload_model(self, model_name):
+@@ -127,6 +181,11 @@ class OffloadModelManager:
+         
+         self._clear_cache()
+     
++    def _load_feature_models(self):
++        self._load_siglip2_model()
++        self._load_clap_model()
++        self._load_syncformer_model()
++
+     def _load_all_models(self):
+         self._load_foley_model()
+         self._load_dac_model()
+@@ -178,7 +237,8 @@ class OffloadModelManager:
+                 'clap_model': self._clap_model,
+                 'syncformer_preprocess': self._syncformer_preprocess,
+                 'syncformer_model': self._syncformer_model,
+-                'device': self.device,
++                'device': self.device_map['foley'],
++                'device_map': self.device_map,
+                 '_manager': self,
+             })
+         else:
+@@ -188,11 +248,16 @@ class OffloadModelManager:
+ class OffloadModelDict:
+     def __init__(self, manager: OffloadModelManager):
+         self.manager = manager
+-        self._device = manager.device
+-    
++        self._device = manager.device_map['foley']
++        self._device_map = manager.device_map
++
+     @property
+     def device(self):
+         return self._device
++
++    @property
++    def device_map(self):
++        return self._device_map
+     
+     @property
+     def foley_model(self):
+@@ -256,19 +321,25 @@ def load_state_dict(model, model_path):
+     logger.info("Model state dict loaded successfully")
+     return model
+ 
+-def load_model(model_path, config_path, device, enable_offload=False, model_size=None):
++def load_model(model_path, config_path, device, enable_offload=False, model_size=None, gpu_ids=None, feature_only=False):
+     logger.info("Starting model loading process...")
+     logger.info(f"Configuration file: {config_path}")
+     logger.info(f"Model weights dir: {model_path}")
+     logger.info(f"Target device: {device}")
+     logger.info(f"Offload mode: {'enabled' if enable_offload else 'disabled'}")
+-    
++
++    device_map = build_device_map(gpu_ids, device)
++    if gpu_ids:
++        logger.info(f"Multi-GPU mode enabled with GPUs: {gpu_ids}")
++        for name, dev in device_map.items():
++            logger.info(f"  {name} -> {dev}")
++
+     model_file_mapping = {
+         "xl": "hunyuanvideo_foley_xl.pth",
+         "xxl": "hunyuanvideo_foley.pth"
+     }
+-    
+-    model_filename = "hunyuanvideo_foley.pth" 
++
++    model_filename = "hunyuanvideo_foley.pth"
+     if model_size and model_size in model_file_mapping:
+         model_filename = model_file_mapping[model_size]
+         logger.info(f"Auto-selected model file for {model_size}: {model_filename}")
+@@ -276,88 +347,28 @@ def load_model(model_path, config_path, device, enable_offload=False, model_size
+         model_filename = model_file_mapping["xl"]
+     elif "xxl" in config_path:
+         model_filename = model_file_mapping["xxl"]
+-    
++
+     logger.info(f"Using model file: {model_filename}")
+-    
+-    if enable_offload:
+-        manager = OffloadModelManager(model_path, config_path, device, enable_offload=True, model_filename=model_filename)
+-        model_dict = manager.create_model_dict()
+-        cfg = manager.cfg
+-        
++
++    # Use OffloadModelManager for both offload and non-offload (it handles device_map)
++    manager = OffloadModelManager(
++        model_path, config_path, device,
++        enable_offload=enable_offload, model_filename=model_filename,
++        device_map=device_map,
++        feature_only=feature_only,
++    )
++    model_dict = manager.create_model_dict()
++    cfg = manager.cfg
++
++    if feature_only:
++        logger.info("Feature-only mode: loaded SigLIP2, Syncformer, CLAP (no Foley/DAC)")
++    elif enable_offload:
+         logger.info("Offload model manager created successfully!")
+         logger.info("Models will be loaded on-demand to save memory")
+-        
+-        return model_dict, cfg
+     else:
+-        cfg = load_yaml(config_path)
+-        logger.info("Configuration loaded successfully")
+-        
+-        # HunyuanVideoFoley
+-        logger.info("Loading HunyuanVideoFoley main model...")
+-        foley_model = HunyuanVideoFoley(cfg, dtype=torch.bfloat16, device=device).to(device=device, dtype=torch.bfloat16)
+-        foley_model = load_state_dict(foley_model, os.path.join(model_path, model_filename))
+-        foley_model.eval()
+-        logger.info("HunyuanVideoFoley model loaded and set to evaluation mode")
+-
+-        # DAC-VAE
+-        dac_path = os.path.join(model_path, "vae_128d_48k.pth")
+-        logger.info(f"Loading DAC VAE model from: {dac_path}")
+-        dac_model = DAC.load(dac_path)
+-        dac_model = dac_model.to(device)
+-        dac_model.requires_grad_(False)
+-        dac_model.eval()
+-        logger.info("DAC VAE model loaded successfully")
+-
+-        # Siglip2 visual-encoder
+-        logger.info("Loading SigLIP2 visual encoder...")
+-        siglip2_preprocess = transforms.Compose([
+-                    transforms.Resize((512, 512)),
+-                    transforms.ToTensor(),
+-                    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+-                ])
+-        siglip2_model = AutoModel.from_pretrained("google/siglip2-base-patch16-512").to(device).eval()
+-        logger.info("SigLIP2 model and preprocessing pipeline loaded successfully")
+-
+-        # clap text-encoder
+-        logger.info("Loading CLAP text encoder...")
+-        clap_tokenizer = AutoTokenizer.from_pretrained("laion/larger_clap_general")
+-        clap_model = ClapTextModelWithProjection.from_pretrained("laion/larger_clap_general").to(device)
+-        logger.info("CLAP tokenizer and model loaded successfully")
+-
+-        # syncformer
+-        syncformer_path = os.path.join(model_path, "synchformer_state_dict.pth")
+-        logger.info(f"Loading Synchformer model from: {syncformer_path}")
+-        syncformer_preprocess = v2.Compose(
+-            [
+-                v2.Resize(224, interpolation=v2.InterpolationMode.BICUBIC),
+-                v2.CenterCrop(224),
+-                v2.ToImage(),
+-                v2.ToDtype(torch.float32, scale=True),
+-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+-            ]
+-        )
+-
+-        syncformer_model = Synchformer()
+-        syncformer_model.load_state_dict(torch.load(syncformer_path, weights_only=False, map_location="cpu"))
+-        syncformer_model = syncformer_model.to(device).eval()
+-        logger.info("Synchformer model and preprocessing pipeline loaded successfully")
+-
+-        logger.info("Creating model dictionary with attribute access...")
+-        model_dict = AttributeDict({
+-            'foley_model': foley_model,
+-            'dac_model': dac_model,
+-            'siglip2_preprocess': siglip2_preprocess,
+-            'siglip2_model': siglip2_model,
+-            'clap_tokenizer': clap_tokenizer,
+-            'clap_model': clap_model,
+-            'syncformer_preprocess': syncformer_preprocess,
+-            'syncformer_model': syncformer_model,
+-            'device': device,
+-        })
+-        
+         logger.info("All models loaded successfully!")
+ 
+-        return model_dict, cfg
++    return model_dict, cfg
+ 
+ def retrieve_timesteps(
+     scheduler,
+@@ -382,6 +393,16 @@ def prepare_latents(scheduler, batch_size, num_channels_latents, length, dtype,
+     return latents
+ 
+ 
++def _get_dac_device(model_dict):
++    """Get the device where dac_model resides."""
++    device_map = getattr(model_dict, 'device_map', None)
++    if device_map is not None:
++        if isinstance(device_map, dict):
++            return device_map.get('dac', model_dict.device)
++        return getattr(device_map, 'dac', model_dict.device)
++    return model_dict.device
++
++
+ @torch.no_grad()
+ def denoise_process(visual_feats, text_feats, audio_len_in_s, model_dict, cfg, guidance_scale=4.5, num_inference_steps=50, batch_size=1):
+ 
+@@ -472,9 +493,9 @@ def denoise_process(visual_feats, text_feats, audio_len_in_s, model_dict, cfg, g
+         latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+ 
+     # Post-process the latents to audio
+-
++    dac_device = _get_dac_device(model_dict)
+     with torch.no_grad():
+-        audio = model_dict.dac_model.decode(latents)
++        audio = model_dict.dac_model.decode(latents.to(dac_device))
+         audio = audio.float().cpu()
+ 
+     audio = audio[:, :int(audio_len_in_s*model_dict.dac_model.sample_rate)]
+diff --git a/infer.py b/infer.py
+index 3ef84de..fd61b96 100644
+--- a/infer.py
++++ b/infer.py
+@@ -143,10 +143,18 @@ def parse_args():
+         help="Device to use for inference"
+     )
+     parser.add_argument(
+-        "--gpu_id", 
+-        type=int, 
++        "--gpu_id",
++        type=int,
+         default=0,
+-        help="GPU ID to use when device is cuda"
++        help="GPU ID to use when device is cuda (single GPU mode)"
++    )
++    parser.add_argument(
++        "--gpu_ids",
++        type=int,
++        nargs='+',
++        default=None,
++        help="Multiple GPU IDs to distribute models across (e.g., --gpu_ids 0 1 2 3). "
++             "Models are distributed: GPU0=foley, GPU1=dac+clap, GPU2=siglip2, GPU3=syncformer"
+     )
+     
+     parser.add_argument(
+@@ -280,7 +288,11 @@ def main():
+     logger.info(f"Output directory: {args.output_dir}")
+     
+     logger.info("Loading models...")
+-    model_dict, cfg = load_model(args.model_path, args.config_path, device, enable_offload=args.enable_offload, model_size=args.model_size)
++    model_dict, cfg = load_model(
++        args.model_path, args.config_path, device,
++        enable_offload=args.enable_offload, model_size=args.model_size,
++        gpu_ids=args.gpu_ids
++    )
+     
+     if args.single_video:
+         process_single_video(

@@ -13,7 +13,7 @@ A positive score means the wrong prompt is more present in the audio than the co
 indicating successful prompt switching (latent intervention).
 
 This script also computes onset F1 from raw frame-wise FLAM probabilities:
-  - GT stream: P_FLAM(correct_prompt, GT_audio, frame)
+    - GT stream: P_FLAM(correct_prompt, GT/source audio, frame)
   - GEN stream: P_FLAM(target_prompt, generated_audio, frame)
   - onset = 0->1 transition after thresholding
   - matching = one-to-one matching within tolerance window
@@ -38,7 +38,15 @@ DURATION = 8.0  # seconds, matching MMAudio generation
 DEFAULT_FLAM_FRAME_SEC = 0.3125
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-DEFAULT_QUANT_RESULTS_DIR = PROJECT_ROOT / "results" / "evaluation" / "VGGSound-Sparse" / "quantitative"
+DEFAULT_QUANT_RESULTS_DIR = (
+    PROJECT_ROOT
+    / "results"
+    / "research_axes"
+    / "evaluation_metrics"
+    / "evaluation"
+    / "VGGSound-Sparse"
+    / "quantitative"
+)
 
 
 def is_eval_dir_name(name: str) -> bool:
@@ -296,25 +304,35 @@ def process_experiment(
         correct_meta_path = sample_dir / "correct" / "metadata.json"
         wrong_meta_path = sample_dir / "wrong" / "metadata.json"
 
-        if not correct_meta_path.exists() or not wrong_meta_path.exists():
-            print(f"[{idx+1}/{len(sample_dirs)}] Skipping {sample_dir.name}: missing metadata")
+        if not wrong_meta_path.exists():
+            print(f"[{idx+1}/{len(sample_dirs)}] Skipping {sample_dir.name}: missing wrong metadata")
             continue
 
-        with open(correct_meta_path) as f:
-            correct_meta = json.load(f)
+        if correct_meta_path.exists():
+            with open(correct_meta_path) as f:
+                correct_meta = json.load(f)
+        else:
+            correct_meta = {}
+
         with open(wrong_meta_path) as f:
             wrong_meta = json.load(f)
 
-        correct_prompt = correct_meta.get("prompt", correct_meta.get("correct_category"))
-        correct_audio_path = sample_dir / "correct" / f"{sample_dir.name}_correct.wav"
-
-        if not correct_audio_path.exists():
-            print(f"[{idx+1}/{len(sample_dirs)}] Skipping {sample_dir.name}: missing correct audio")
+        correct_prompt = (
+            correct_meta.get("prompt")
+            or correct_meta.get("correct_category")
+            or wrong_meta.get("source_prompt")
+            or wrong_meta.get("correct_category")
+        )
+        if not correct_prompt:
+            print(f"[{idx+1}/{len(sample_dirs)}] Skipping {sample_dir.name}: missing source prompt")
             continue
+
+        correct_audio_path = sample_dir / "correct" / f"{sample_dir.name}_correct.wav"
+        has_correct_audio = correct_audio_path.exists()
 
         # Collect wrong results and build batch
         wrong_results = wrong_meta.get("results", [])
-        audio_paths = [str(correct_audio_path)]
+        audio_paths = [str(correct_audio_path)] if has_correct_audio else []
         valid_wrong = []
         for wr in wrong_results:
             wrong_audio_path = sample_dir / "wrong" / wr["audio_file"]
@@ -342,46 +360,61 @@ def process_experiment(
         act_map = compute_flam_activation_batch(flam_model, audio_paths, all_texts, device)
         scores = act_map.max(axis=-1)  # [num_audios, num_texts]
 
-        correct_idx = 0  # correct audio is first in batch
+        correct_idx = 0 if has_correct_audio else None
         correct_text_idx = text_to_idx[correct_prompt]
         tolerance_frames = onset_tolerance_sec / flam_frame_sec
 
         for i, wr in enumerate(valid_wrong):
-            wrong_audio_idx = i + 1  # wrong audios start at index 1
+            wrong_audio_idx = i + 1 if has_correct_audio else i
             target_text_idx = text_to_idx[wr["target_prompt"]]
 
             wrong_flam_target = float(scores[wrong_audio_idx, target_text_idx])
             wrong_flam_correct = float(scores[wrong_audio_idx, correct_text_idx])
             delta = wrong_flam_target - wrong_flam_correct
 
-            correct_flam_correct = float(scores[correct_idx, correct_text_idx])
-            correct_flam_target = float(scores[correct_idx, target_text_idx])
+            if correct_idx is not None:
+                correct_flam_correct = float(scores[correct_idx, correct_text_idx])
+                correct_flam_target = float(scores[correct_idx, target_text_idx])
 
-            # Onset F1 from raw frame-wise FLAM probabilities
-            s_gt = act_map[correct_idx, correct_text_idx]
-            s_gen = act_map[wrong_audio_idx, target_text_idx]
-            gt_onsets = extract_onset_frames(s_gt, onset_threshold)
-            gen_onsets = extract_onset_frames(s_gen, onset_threshold)
-            tp, fp, fn = match_onsets_one_to_one(gt_onsets, gen_onsets, tolerance_frames)
-            onset_precision, onset_recall, onset_f1 = compute_precision_recall_f1(tp, fp, fn)
+                # Onset F1 from raw frame-wise FLAM probabilities
+                s_gt = act_map[correct_idx, correct_text_idx]
+                s_gen = act_map[wrong_audio_idx, target_text_idx]
+                gt_onsets = extract_onset_frames(s_gt, onset_threshold)
+                gen_onsets = extract_onset_frames(s_gen, onset_threshold)
+                tp, fp, fn = match_onsets_one_to_one(gt_onsets, gen_onsets, tolerance_frames)
+                onset_precision, onset_recall, onset_f1 = compute_precision_recall_f1(tp, fp, fn)
+            else:
+                correct_flam_correct = None
+                correct_flam_target = None
+                gt_onsets = np.array([], dtype=np.int64)
+                gen_onsets = np.array([], dtype=np.int64)
+                tp = fp = fn = None
+                onset_precision = onset_recall = onset_f1 = None
 
             results.append({
                 "sample_id": sample_dir.name,
                 "correct_prompt": correct_prompt,
                 "target_prompt": wr["target_prompt"],
+                "target_field": wr.get("target_field"),
+                "target_level": wr.get("target_level"),
+                "conflict_level": wr.get("conflict_level"),
                 "wrong_audio_flam_target": round(wrong_flam_target, 4),
                 "wrong_audio_flam_correct": round(wrong_flam_correct, 4),
                 "delta_flam": round(delta, 4),
-                "correct_audio_flam_correct": round(correct_flam_correct, 4),
-                "correct_audio_flam_target": round(correct_flam_target, 4),
-                "gt_onset_count": int(len(gt_onsets)),
-                "gen_onset_count": int(len(gen_onsets)),
-                "onset_tp": int(tp),
-                "onset_fp": int(fp),
-                "onset_fn": int(fn),
-                "onset_precision": round(onset_precision, 4),
-                "onset_recall": round(onset_recall, 4),
-                "onset_f1": round(onset_f1, 4),
+                "correct_audio_flam_correct": (
+                    round(correct_flam_correct, 4) if correct_flam_correct is not None else None
+                ),
+                "correct_audio_flam_target": (
+                    round(correct_flam_target, 4) if correct_flam_target is not None else None
+                ),
+                "gt_onset_count": int(len(gt_onsets)) if correct_idx is not None else None,
+                "gen_onset_count": int(len(gen_onsets)) if correct_idx is not None else None,
+                "onset_tp": int(tp) if tp is not None else None,
+                "onset_fp": int(fp) if fp is not None else None,
+                "onset_fn": int(fn) if fn is not None else None,
+                "onset_precision": round(onset_precision, 4) if onset_precision is not None else None,
+                "onset_recall": round(onset_recall, 4) if onset_recall is not None else None,
+                "onset_f1": round(onset_f1, 4) if onset_f1 is not None else None,
             })
 
         print(f"[{idx+1}/{len(sample_dirs)}] Done: {sample_dir.name} ({correct_prompt})")
@@ -390,6 +423,7 @@ def process_experiment(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "sample_id", "correct_prompt", "target_prompt",
+        "target_field", "target_level", "conflict_level",
         "wrong_audio_flam_target", "wrong_audio_flam_correct", "delta_flam",
         "correct_audio_flam_correct", "correct_audio_flam_target",
         "gt_onset_count", "gen_onset_count",
@@ -421,12 +455,12 @@ def process_experiment(
         delta_mean = float(np.mean(deltas))
         delta_std = float(np.std(deltas))
         delta_pos_ratio = float(np.mean(np.array(deltas) > 0))
-        onset_f1s = [r["onset_f1"] for r in results]
-        onset_precs = [r["onset_precision"] for r in results]
-        onset_recs = [r["onset_recall"] for r in results]
-        onset_tps = [r["onset_tp"] for r in results]
-        onset_fps = [r["onset_fp"] for r in results]
-        onset_fns = [r["onset_fn"] for r in results]
+        onset_f1s = [r["onset_f1"] for r in results if r["onset_f1"] is not None]
+        onset_precs = [r["onset_precision"] for r in results if r["onset_precision"] is not None]
+        onset_recs = [r["onset_recall"] for r in results if r["onset_recall"] is not None]
+        onset_tps = [r["onset_tp"] for r in results if r["onset_tp"] is not None]
+        onset_fps = [r["onset_fp"] for r in results if r["onset_fp"] is not None]
+        onset_fns = [r["onset_fn"] for r in results if r["onset_fn"] is not None]
 
         print(f"\n{'='*60}")
         print(f"Experiment: {exp_dir.name}")
@@ -438,9 +472,12 @@ def process_experiment(
         print(f"delta_flam > 0 ratio: {delta_pos_ratio:.4f}")
         print(f"Onset threshold: {onset_threshold:.4f}")
         print(f"Onset tolerance: {onset_tolerance_sec:.4f}s ({onset_tolerance_sec / flam_frame_sec:.2f} frames)")
-        print(f"Onset Precision (macro): {float(np.mean(onset_precs)):.4f}")
-        print(f"Onset Recall (macro):    {float(np.mean(onset_recs)):.4f}")
-        print(f"Onset F1 (macro):        {float(np.mean(onset_f1s)):.4f}")
+        if onset_f1s:
+            print(f"Onset Precision (macro): {float(np.mean(onset_precs)):.4f}")
+            print(f"Onset Recall (macro):    {float(np.mean(onset_recs)):.4f}")
+            print(f"Onset F1 (macro):        {float(np.mean(onset_f1s)):.4f}")
+        else:
+            print("Onset metrics: skipped (no generated correct/source audio present)")
         print(f"Results saved to: {output_path}")
 
         # Per target category summary
@@ -455,17 +492,49 @@ def process_experiment(
             cat_mean = float(np.mean(vals))
             cat_std = float(np.std(vals))
             cat_n = len(vals)
-            cat_onset_f1_mean = float(np.mean([r["onset_f1"] for r in cat_rows]))
+            cat_onset_f1_values = [r["onset_f1"] for r in cat_rows if r["onset_f1"] is not None]
+            cat_onset_f1_mean = (
+                float(np.mean(cat_onset_f1_values)) if cat_onset_f1_values else None
+            )
             print(
                 f"  {cat:25s}  mean={cat_mean:+.4f}  std={cat_std:.4f}  "
                 f"onset_f1={cat_onset_f1_mean:.4f}  n={cat_n}"
+                if cat_onset_f1_mean is not None
+                else f"  {cat:25s}  mean={cat_mean:+.4f}  std={cat_std:.4f}  n={cat_n}"
             )
             per_target_summary[cat] = {
                 "mean": round(cat_mean, 4),
                 "std": round(cat_std, 4),
-                "onset_f1_mean": round(cat_onset_f1_mean, 4),
                 "n": cat_n,
             }
+            if cat_onset_f1_mean is not None:
+                per_target_summary[cat]["onset_f1_mean"] = round(cat_onset_f1_mean, 4)
+
+        per_target_field_summary = {}
+        if any(r.get("target_field") for r in results):
+            by_target_field = defaultdict(list)
+            for r in results:
+                if r.get("target_field"):
+                    by_target_field[r["target_field"]].append(r)
+            print(f"\nPer target field:")
+            for field in sorted(by_target_field.keys()):
+                rows = by_target_field[field]
+                vals = [r["delta_flam"] for r in rows]
+                field_onset_f1s = [r["onset_f1"] for r in rows if r["onset_f1"] is not None]
+                field_summary = {
+                    "mean": round(float(np.mean(vals)), 4),
+                    "std": round(float(np.std(vals)), 4),
+                    "positive_ratio": round(float(np.mean(np.array(vals) > 0)), 4),
+                    "n": len(rows),
+                }
+                if field_onset_f1s:
+                    field_summary["onset_f1_mean"] = round(float(np.mean(field_onset_f1s)), 4)
+                print(
+                    f"  {field:20s}  mean={field_summary['mean']:+.4f}  "
+                    f"std={field_summary['std']:.4f}  "
+                    f"pos={field_summary['positive_ratio']:.4f}  n={field_summary['n']}"
+                )
+                per_target_field_summary[field] = field_summary
 
         summary.update({
             "wrong_audio_flam_source_prompt_mean": round(wrong_flam_source_mean, 4),
@@ -473,13 +542,14 @@ def process_experiment(
             "delta_flam_mean": round(delta_mean, 4),
             "delta_flam_std": round(delta_std, 4),
             "delta_flam_positive_ratio": round(delta_pos_ratio, 4),
-            "onset_precision_macro": round(float(np.mean(onset_precs)), 4),
-            "onset_recall_macro": round(float(np.mean(onset_recs)), 4),
-            "onset_f1_macro": round(float(np.mean(onset_f1s)), 4),
-            "onset_tp_total": int(np.sum(onset_tps)),
-            "onset_fp_total": int(np.sum(onset_fps)),
-            "onset_fn_total": int(np.sum(onset_fns)),
+            "onset_precision_macro": round(float(np.mean(onset_precs)), 4) if onset_precs else None,
+            "onset_recall_macro": round(float(np.mean(onset_recs)), 4) if onset_recs else None,
+            "onset_f1_macro": round(float(np.mean(onset_f1s)), 4) if onset_f1s else None,
+            "onset_tp_total": int(np.sum(onset_tps)) if onset_tps else None,
+            "onset_fp_total": int(np.sum(onset_fps)) if onset_fps else None,
+            "onset_fn_total": int(np.sum(onset_fns)) if onset_fns else None,
             "per_target": per_target_summary,
+            "per_target_field": per_target_field_summary,
         })
     else:
         print("No results computed.")
@@ -517,7 +587,8 @@ def main():
         default=None,
         help=(
             "Output CSV path. Defaults to "
-            "results/evaluation/VGGSound-Sparse/quantitative/YYYY-MM-DD_exp-name/flam_scores*.csv."
+            "results/research_axes/evaluation_metrics/evaluation/"
+            "VGGSound-Sparse/quantitative/YYYY-MM-DD_exp-name/flam_scores*.csv."
         ),
     )
     parser.add_argument(

@@ -6,6 +6,7 @@ Recommended layout:
 
 ```text
 pretrained/mmaudio/
+pretrained/hunyuan-video-foley/
 pretrained/etc/
 ```
 

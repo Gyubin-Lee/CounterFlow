@@ -1,10 +1,13 @@
 """Minimal CounterFlow demo entry point.
 
 Required environment:
-    conda activate MMAudio
+    MMAudio backend:
+        conda activate MMAudio
+    Hunyuan backend:
+        conda activate Hunyuan
 
 Purpose:
-    Launch a one-video CounterFlow-MMAudio pilot run.
+    Launch a one-video pilot run through the selected backend.
 """
 
 from __future__ import annotations
@@ -18,11 +21,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from counterflow.hunyuan import HunyuanCounterFlowWrapper
 from counterflow.mmaudio import MMAudioCounterFlowWrapper
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(description="Run a minimal CounterFlow demo")
+    parser.add_argument("--backend", choices=["mmaudio", "hunyuan"], required=True)
     parser.add_argument("--exp-name", default="demo_counterflow")
     parser.add_argument(
         "--output-dir",
@@ -35,7 +40,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     args, backend_args = parse_args()
-    wrapper = MMAudioCounterFlowWrapper(PROJECT_ROOT)
+    wrapper = MMAudioCounterFlowWrapper(PROJECT_ROOT) if args.backend == "mmaudio" else HunyuanCounterFlowWrapper(PROJECT_ROOT)
     clean_csv_path = PROJECT_ROOT / "datasets" / "VGGSound-Sparse" / "vggsound_sparse_clean_fixed_offsets.csv"
     command = wrapper.build_command(
         output_dir=args.output_dir,

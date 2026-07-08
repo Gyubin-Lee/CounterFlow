@@ -10,12 +10,16 @@ external/         Cloned third-party repositories, ignored by Git
 baselines/        Baseline repositories such as CAFA and ReWaS, ignored by Git
 datasets/         Local datasets and feature caches, ignored by Git
 pretrained/       Local model checkpoints, ignored by Git
-experiments/      Experiment entry points
+experiments/      Experiment entry points grouped by research axis
 evaluation/       Evaluation code only
 results/          Generated experiment and evaluation outputs, ignored by Git
-scripts/          Setup and utility scripts
+scripts/          Shared utility scripts and research-axis runners
+configs/          Lightweight project-owned configs grouped by research axis
 patches/          Reproducible patches for external repositories
 ```
+
+Private research notes live under `docs/` in the private workspace and are not
+included in public exports.
 
 ## Setup
 
@@ -26,7 +30,7 @@ pip install -r requirements.txt
 bash scripts/setup_external_repos.sh
 ```
 
-This repository contains only CounterFlow-level requirements. MMAudio and av-benchmark may require their own dependencies. Please refer to each external repository for backend-specific setup.
+This repository contains only CounterFlow-level requirements. MMAudio, HunyuanVideo-Foley, and av-benchmark may require their own dependencies. Please refer to each external repository for backend-specific setup.
 
 ## External Repositories
 
@@ -34,6 +38,7 @@ External repositories live under:
 
 ```text
 external/MMAudio/
+external/HunyuanVideo-Foley/
 external/av-benchmark/
 ```
 
@@ -50,7 +55,19 @@ cd external/MMAudio
 git apply ../../patches/mmaudio_networks_counterflow.patch
 ```
 
-CounterFlow backend entry scripts are stored under `counterflow/mmaudio/`. The setup script copies them into MMAudio when the corresponding external files are missing or outdated.
+Apply the other backend patches only when needed:
+
+```bash
+cd external/HunyuanVideo-Foley
+git apply ../../patches/hunyuanvideo_foley_counterflow.patch
+```
+
+```bash
+cd external/av-benchmark
+git apply ../../patches/av_benchmark_counterflow.patch
+```
+
+CounterFlow backend entry scripts are stored under `counterflow/mmaudio/` and `counterflow/hunyuan/`. The setup script copies them into the external repositories when the corresponding external files are missing or outdated. The Hunyuan latent-intervention script is stored at `counterflow/hunyuan/infer_latent_intervention.py` and is installed into `external/HunyuanVideo-Foley/infer_latent_intervention.py`.
 
 ## Conda Environments
 
@@ -105,6 +122,12 @@ python -m pip install openflam
 
 If `git apply` reports that the MMAudio patch is already applied, keep going. Avoid installing OpenFLAM before the PyTorch 2.6.0 stack above is in place; otherwise pip may upgrade the torch packages to a mismatched set. If packages installed in `~/.local` still leak into your Conda environment, keep `PYTHONNOUSERSITE=1` set while running inference and evaluation commands.
 
+Use the `Hunyuan` Conda environment for HunyuanVideo-Foley-based CounterFlow experiments and inference:
+
+```bash
+conda activate Hunyuan
+```
+
 ## Pretrained Models
 
 Do not commit pretrained model files. MMAudio checkpoints are downloaded automatically by the MMAudio backend on first run. For CLAP and DeSync evaluation, prepare av-benchmark checkpoints with:
@@ -124,6 +147,7 @@ Local or manually downloaded model files can also be placed under:
 
 ```text
 pretrained/mmaudio/
+pretrained/hunyuan-video-foley/
 pretrained/etc/
 ```
 
@@ -152,58 +176,25 @@ These directories are ignored because they may contain downloaded code, checkpoi
 
 ## Experiments
 
+MMAudio backend:
+
 ```bash
 conda activate MMAudio
-python experiments/exp_vggsound_sparse.py \
-  --exp-name 2026-05-05_counterflow-mmaudio-default \
-  --csv_path datasets/VGGSound-Sparse/vggsound_sparse.csv \
-  --clean_csv_path datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
-  --video_root /path/to/vggsound/video
+python experiments/research_axes/latent_update_method/exp_vggsound_sparse.py --backend mmaudio --exp-name 20260505_counterflow_mmaudio_default
+```
+
+Hunyuan backend:
+
+```bash
+conda activate Hunyuan
+python experiments/research_axes/latent_update_method/exp_vggsound_sparse.py --backend hunyuan --exp-name 20260505_counterflow_hunyuan_default
 ```
 
 Use `--dry-run` to print the backend command without launching inference.
 
 The default CounterFlow-MMAudio experiment config matches the public demo: `cfg_text=5.0`, `transition_step=17`, Phase 1 ODE, Phase 2 ODE, `sigma=0.0`, and `seed=42`.
 
-For a quick clean-subset smoke test, use `--pilot --pilot_n 3` with `--subset clean`:
-
-```bash
-conda activate MMAudio
-CUDA_VISIBLE_DEVICES=0 PYTHONNOUSERSITE=1 python experiments/exp_vggsound_sparse.py \
-  --exp-name smoke_mmaudio_clean3 \
-  --subset clean \
-  --pilot \
-  --pilot_n 3 \
-  --gpu 0 \
-  --csv_path datasets/VGGSound-Sparse/vggsound_sparse.csv \
-  --clean_csv_path datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
-  --video_root /path/to/vggsound/video
-```
-
 ## Demos
-
-Run the public CounterFlow prompt-switch demo with the tracked videos:
-
-```bash
-conda activate MMAudio
-export PYTHONNOUSERSITE=1
-CUDA_VISIBLE_DEVICES=0 python run_counterflow_demo.py --gpu 0
-```
-
-This demo uses:
-
-```text
-datasets/demo_videos/cat.mp4: source prompt "cat meowing" -> target prompt "horse neighing"
-datasets/demo_videos/dog.mp4: source prompt "dog barking" -> target prompt "bear growling"
-```
-
-Outputs are written under:
-
-```text
-results/demo/counterflow-cat-dog/
-```
-
-The default demo config is `cfg_text=5.0`, `transition_step=17`, Phase 1 ODE, Phase 2 ODE, `sigma=0.0`, and `seed=42`.
 
 Run CounterFlow-MMAudio on a small local video manifest:
 
@@ -226,7 +217,12 @@ datasets/demo_videos/example_000002.mp4,striking bowling
 
 ```bash
 conda activate MMAudio
-python demos/demo_CounterFlow.py --dry-run
+python demos/demo_CounterFlow.py --backend mmaudio --dry-run
+```
+
+```bash
+conda activate Hunyuan
+python demos/demo_CounterFlow.py --backend hunyuan --dry-run
 ```
 
 ## Evaluation
@@ -237,7 +233,7 @@ Quantitative VGGSound-Sparse evaluation should run in the `MMAudio` environment:
 conda activate MMAudio
 export PYTHONNOUSERSITE=1
 python evaluation/eval_vggsound_sparse_metrics.py \
-  --output_dir results/evaluation/VGGSound-Sparse/qualitative/2026-05-05_counterflow-mmaudio-default \
+  --output_dir results/research_axes/latent_update_method/evaluation/VGGSound-Sparse/qualitative/20260505_counterflow_mmaudio_default \
   --filter_csv datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
   --gpu 0
 ```
@@ -250,32 +246,33 @@ FLAM metric evaluation:
 conda activate MMAudio
 export PYTHONNOUSERSITE=1
 python evaluation/eval_flam_metric.py \
-  --exp_dir results/evaluation/VGGSound-Sparse/qualitative/2026-05-05_counterflow-mmaudio-default \
+  --exp_dir results/research_axes/latent_update_method/evaluation/VGGSound-Sparse/qualitative/20260505_counterflow_mmaudio_default \
   --filter_csv datasets/VGGSound-Sparse/vggsound_sparse_clean_fixed_offsets.csv \
   --gpu_id 0
 ```
 
-Qualitative analysis notebook:
-
-```bash
-jupyter notebook evaluation/qualitative_analysis.ipynb
-```
-
 ## Results Convention
 
-Store quantitative outputs under:
+Store new quantitative outputs under:
 
 ```text
-results/evaluation/VGGSound-Sparse/quantitative/YYYY-MM-DD_model-dataset-setting/
+results/research_axes/<axis>/evaluation/<dataset>/quantitative/YYYYMMDD_model_dataset_setting/
 ```
 
-Store qualitative samples, figures, and inspection artifacts under:
+Store new qualitative samples, figures, and inspection artifacts under:
 
 ```text
-results/evaluation/VGGSound-Sparse/qualitative/YYYY-MM-DD_model-dataset-setting/
+results/research_axes/<axis>/evaluation/<dataset>/qualitative/YYYYMMDD_model_dataset_setting/
 ```
 
-Generated results are ignored by Git. Keep only `results/README.md` tracked.
+Use `YYYYMMDD_<short_experiment_description>` for every new experiment folder.
+Keep the part after the date in lower snake case so result folders sort and
+match across prompt, media, metric, and log directories.
+
+Use the axis-grouped paths above as the only canonical result locations. Avoid
+creating legacy result aliases or duplicate result folders; update old
+commands instead. Generated results are ignored by Git. Keep only
+`results/README.md` tracked.
 
 ## Git-Ignored Files
 

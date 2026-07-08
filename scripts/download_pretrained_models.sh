@@ -5,7 +5,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 AV_BENCH_WEIGHTS="${ROOT_DIR}/external/av-benchmark/weights"
-mkdir -p "${ROOT_DIR}/pretrained/mmaudio" "${AV_BENCH_WEIGHTS}"
+
+mkdir -p \
+  "${AV_BENCH_WEIGHTS}" \
+  "${ROOT_DIR}/pretrained/mmaudio" \
+  "${ROOT_DIR}/pretrained/hunyuan-video-foley"
 
 download_if_missing() {
   local url="$1"
@@ -40,5 +44,9 @@ Evaluation checkpoints are ready under:
   ${AV_BENCH_WEIGHTS}
 
 MMAudio model checkpoints are downloaded automatically by the MMAudio backend on first run.
-All checkpoint files are ignored by Git.
+Additional local model files can be placed under:
+  pretrained/mmaudio/
+  pretrained/hunyuan-video-foley/
+
+Checkpoints are ignored by Git.
 MSG

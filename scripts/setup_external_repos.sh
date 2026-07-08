@@ -22,6 +22,7 @@ clone_if_missing() {
 }
 
 clone_if_missing "MMAudio" "https://github.com/hkchengrex/MMAudio"
+clone_if_missing "HunyuanVideo-Foley" "https://github.com/Tencent-Hunyuan/HunyuanVideo-Foley"
 clone_if_missing "av-benchmark" "https://github.com/hkchengrex/av-benchmark"
 
 install_if_changed() {
@@ -37,5 +38,14 @@ install_if_changed() {
 install_if_changed \
   "${ROOT_DIR}/counterflow/mmaudio/eval_vggsound_sparse.py" \
   "${EXTERNAL_DIR}/MMAudio/eval_vggsound_sparse.py"
+
+install_if_changed \
+  "${ROOT_DIR}/counterflow/hunyuan/eval_vggsound_sparse.py" \
+  "${EXTERNAL_DIR}/HunyuanVideo-Foley/eval_vggsound_sparse.py"
+
+HUNYUAN_SCRIPT_SRC="${ROOT_DIR}/counterflow/hunyuan/infer_latent_intervention.py"
+HUNYUAN_SCRIPT_DST="${EXTERNAL_DIR}/HunyuanVideo-Foley/infer_latent_intervention.py"
+
+install_if_changed "${HUNYUAN_SCRIPT_SRC}" "${HUNYUAN_SCRIPT_DST}"
 
 echo "External repository setup complete."
